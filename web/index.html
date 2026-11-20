@@ -28,14 +28,30 @@
   .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; overflow:hidden; }
   .card header { padding:10px 14px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; color:var(--dim); font-size:12.5px; }
   .card img { display:block; width:100%; height:auto; background:#0a0d10; }
-  .slider { position:relative; user-select:none; }
-  .slider img { position:absolute; inset:0; width:100%; height:100%; object-fit:contain; }
-  .slider .after { position:absolute; inset:0; clip-path:inset(0 50% 0 0); }
-  .slider input { position:absolute; bottom:12px; left:4%; width:92%; accent-color:var(--acc); }
-  .slider .frame { position:relative; padding-top:66%; }
   .spinner { display:inline-block; width:14px; height:14px; border:2px solid var(--line); border-top-color:var(--acc); border-radius:50%; animation:spin .8s linear infinite; vertical-align:-2px; margin-right:6px; }
   @keyframes spin { to { transform:rotate(360deg); } }
   .hint { color:var(--dim); font-size:12px; margin-top:10px; }
+
+  /* ---- 进度条 ---- */
+  .prog { margin-top:14px; }
+  .progbar { height:8px; background:#0a0d10; border-radius:99px; overflow:hidden; }
+  .progbar i { display:block; height:100%; width:0%; background:var(--acc); border-radius:99px; transition:width .3s; }
+  .progtext { color:var(--dim); font-size:12.5px; margin-top:6px; min-height:18px; }
+
+  /* ---- 缩放/平移对比查看器 ---- */
+  .viewer { position:relative; height:clamp(420px, 62vh, 780px); background:
+    repeating-conic-gradient(#0c1015 0% 25%, #12171e 0% 50%) 0 / 24px 24px; user-select:none; touch-action:none; cursor:grab; }
+  .viewer.panning { cursor:grabbing; }
+  .viewer.col-resizing { cursor:col-resize; }
+  .viewer canvas { position:absolute; inset:0; width:100%; height:100%; display:block; }
+  .divline { position:absolute; top:0; bottom:0; width:0; border-left:2px solid var(--acc); pointer-events:none; }
+  .divline .grab { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); background:var(--acc); color:#04121f;
+    font-size:11px; font-weight:700; padding:3px 7px; border-radius:99px; pointer-events:none; white-space:nowrap; }
+  .badge { position:absolute; top:10px; padding:2px 9px; border-radius:99px; font-size:11.5px; background:#0a0d10cc; border:1px solid var(--line); color:var(--dim); pointer-events:none; }
+  .badge.l { left:10px; } .badge.r { right:10px; }
+  .zoombar { position:absolute; right:10px; bottom:10px; display:flex; gap:6px; }
+  .zoombar button { padding:4px 10px; font-size:12.5px; background:#0a0d10dd; }
+  .vhint { position:absolute; left:10px; bottom:10px; color:#8b97a7b0; font-size:11.5px; pointer-events:none; }
 </style>
 </head>
 <body>
@@ -47,7 +63,7 @@
     <div class="drop" id="drop">
       <div>点击选择 或 拖放图片到这里</div>
       <div class="hint" id="pickInfo"></div>
-      <input type="file" id="file" accept="image/*" hidden>
+      <input type="file" id="file" accept="image/*,.dng,.tif,.tiff,.avif" hidden>
     </div>
     <div class="row" style="margin-top:14px">
       <label>后端</label>
@@ -56,26 +72,62 @@
         <option value="cpu">CPU</option>
       </select>
       <label>放大</label>
-      <select id="scale"><option value="4" selected>4×</option></select>
+      <select id="scale">
+        <option value="2">2×</option>
+        <option value="3">3×</option>
+        <option value="4" selected>4×</option>
+      </select>
+      <label title="超分结果与原生插值(上采样)的混合比例。100% = 全超分; 调低可缓解模型细节过锐的假感。改动即时生效, 复用上次超分缓存重新混合, 不重新推理">混合强度</label>
+      <select id="mix">
+        <option value="100" selected>100%（全超分）</option>
+        <option value="90">90%</option>
+        <option value="80">80%</option>
+        <option value="70">70%</option>
+        <option value="60">60%</option>
+        <option value="50">50%</option>
+        <option value="40">40%</option>
+        <option value="30">30%</option>
+        <option value="20">20%</option>
+        <option value="10">10%</option>
+        <option value="0">0%（纯插值）</option>
+      </select>
+      <label>输出格式</label>
+      <select id="fmt">
+        <option value="png" selected>PNG（无损）</option>
+        <option value="jpg">JPEG（高质量）</option>
+        <option value="webp" id="fmtWebp">WebP</option>
+        <option value="avif" id="fmtAvif">AVIF（HDR 保持位深）</option>
+        <option value="bmp">BMP（无损）</option>
+      </select>
       <button class="primary" id="run" disabled>开始超分</button>
       <span class="meta" id="status"></span>
     </div>
-    <div class="hint">输出尺寸 = 输入 × 4。tile 管线，任意分辨率可用。</div>
+    <div class="prog" id="prog" hidden>
+      <div class="progbar"><i id="progfill"></i></div>
+      <div class="progtext" id="progtext"></div>
+    </div>
+    <div class="hint" id="scaleHint">输出尺寸 = 输入 × 4。tile 管线，任意分辨率可用。</div>
   </div>
 
   <div class="views" id="views" hidden>
     <div class="card">
-      <header><span>对比（拖动滑块）</span><span id="dims"></span></header>
-      <div class="slider" id="slider">
-        <div class="frame">
-          <img id="imgBefore" alt="before">
-          <img id="imgAfter" class="after" alt="after">
+      <header><span>对比 · 滚轮缩放 / 拖拽平移 / 拖动分割线</span><span id="dims"></span></header>
+      <div class="viewer" id="viewer">
+        <canvas id="cv"></canvas>
+        <div class="divline" id="divline"><div class="grab">⟨ 原图 | 超分 ⟩</div></div>
+        <div class="badge l">原图</div>
+        <div class="badge r">超分</div>
+        <div class="zoombar">
+          <button id="zOut">−</button>
+          <button id="zFit">适应</button>
+          <button id="z100">1:1</button>
+          <button id="zIn">+</button>
         </div>
-        <input type="range" id="range" min="0" max="100" value="50">
+        <div class="vhint" id="vhint"></div>
       </div>
     </div>
     <div class="card">
-      <header><span>结果（4×）<span id="previewNote" style="opacity:.7"></span></span><a id="dl" href="#" download="tinysr_4x.png" style="color:var(--acc);text-decoration:none">下载 PNG</a></header>
+      <header><span>结果<span id="previewNote" style="opacity:.7"></span></span><a id="dl" href="#" download="tinysr_4x.png" style="color:var(--acc);text-decoration:none">下载 PNG</a></header>
       <img id="imgFull" alt="result">
     </div>
   </div>
@@ -83,26 +135,49 @@
 <script>
 const $ = id => document.getElementById(id);
 let file = null, beforeURL = null, previewURL = null, imgW = 0, imgH = 0;
+let srcImgEl = null;   // 原始文件 Image (供客户端混合锚点用; 浏览器解不出时为 null)
+let SR_SCALE = 4;
 
 // 与服务端 tile 策略一致 (参数从 /api/info 取: 512px tile, step = (64-overlap)*8)
 let TILE_PX = 512, STEP_PX = 448;
-function estTiles(w, h) {
-  const nw = Math.floor(w * 4 / 8) * 8, nh = Math.floor(h * 4 / 8) * 8;
+// 与服务端 TileGrid 一致 (phase=0): 起点 0,step,2*step...<=n-tile, 末端不够再补一块
+function gridCount(n, tile, step) {
+  const last = n - tile;
+  if (last <= 0) return 1;
+  const k = Math.floor(last / step) + 1;
+  return ((k - 1) * step + tile < n) ? k + 1 : k;
+}
+function estTiles(w, h, scale) {
+  const nw = Math.floor(w * scale / 8) * 8, nh = Math.floor(h * scale / 8) * 8;
   const pW = Math.ceil(nw / TILE_PX) * TILE_PX, pH = Math.ceil(nh / TILE_PX) * TILE_PX;
-  return Math.ceil((pW / 8) / (STEP_PX / 8)) * Math.ceil((pH / 8) / (STEP_PX / 8));
+  return gridCount(pW / 8, TILE_PX / 8, STEP_PX / 8) * gridCount(pH / 8, TILE_PX / 8, STEP_PX / 8);
 }
 
-// 探测后端能力: 没有 Vulkan 设备时禁用 GPU 选项
+// 探测后端能力: 没有 Vulkan 设备时禁用 GPU 选项; 档位默认值跟服务端对齐
 fetch('/api/info').then(r => r.json()).then(info => {
   if (info.tile) TILE_PX = info.tile;
   if (info.step) STEP_PX = info.step;
+  if (info.scale) SR_SCALE = info.scale;
+  SRV_FMT = { webp: !!info.webp, avif: !!info.avif };
   const sel = $('backend'), opt = sel.querySelector('option[value=vulkan]');
   if (!info.vulkan_capable) {
     opt.disabled = true;
     opt.textContent = 'Vulkan GPU（本机不可用）';
     sel.value = 'cpu';
+  } else if (info.gpu) {
+    opt.textContent = `Vulkan GPU（${String(info.gpu).slice(0, 42)}）`;
   }
+  // 输出格式按服务端编译期库开关禁用
+  if (!SRV_FMT.webp) $('fmtWebp').disabled = true;
+  if (!SRV_FMT.avif) $('fmtAvif').disabled = true;
+  updateScaleUI();
 }).catch(() => {});
+
+function updateScaleUI() {
+  $('scale').value = String(SR_SCALE);
+  $('scaleHint').textContent = `输出尺寸 = 输入 × ${SR_SCALE}。tile 管线，任意分辨率可用。`;
+}
+$('scale').addEventListener('change', () => { SR_SCALE = +$('scale').value; updateScaleUI(); refreshPickInfo(); });
 
 function setStatus(html) { $('status').innerHTML = html; }
 
@@ -115,28 +190,76 @@ $('drop').addEventListener('drop', e => {
 });
 $('file').addEventListener('change', e => { if (e.target.files.length) pick(e.target.files[0]); });
 
+function refreshPickInfo() {
+  if (!file || !imgW) return;
+  const t = estTiles(imgW, imgH, SR_SCALE);
+  $('pickInfo').textContent = `${file.name} · ${imgW}×${imgH} → ${imgW*SR_SCALE}×${imgH*SR_SCALE} · ${t} tiles`;
+}
+
+// 服务端能力: 支持的输出格式按编译期库开关禁用
+let SRV_FMT = {};
+
 function pick(f) {
-  if (!f.type.startsWith('image/')) return setStatus('请选择图片文件');
+  // 浏览器给 DNG/RAW 标 application/octet-stream, 按扩展名放行
+  const okType = (f.type && f.type.startsWith('image/')) ||
+                 /\.(dng|tiff?|avif|webp|bmp|jpe?g|png|gif|tga|pnm|psd)$/i.test(f.name);
+  if (!okType) return setStatus('请选择图片文件 (支持 JPEG/PNG/WebP/TIFF/AVIF/DNG/BMP/GIF 等)');
   file = f;
+  SR_CACHE = null;
   if (beforeURL) URL.revokeObjectURL(beforeURL);
   beforeURL = URL.createObjectURL(f);
   const img = new Image();
   img.onload = () => {
     imgW = img.width; imgH = img.height;
-    const t = estTiles(imgW, imgH);
-    $('pickInfo').textContent = `${f.name} · ${imgW}×${imgH} → ${imgW*4}×${imgH*4} · ${t} tiles`;
-    $('imgBefore').src = beforeURL;
+    srcImgEl = img;
+    refreshPickInfo();
+    viewerSetBefore(img);
     $('run').disabled = false;
+  };
+  img.onerror = () => {
+    // 浏览器解不出 (DNG 等): 走服务端探测拿尺寸; before 层留白
+    const fd = new FormData();
+    fd.append('image', f);
+    fetch('/api/probe', { method: 'POST', body: fd }).then(r => r.json()).then(p => {
+      if (!p.w) throw new Error(p.error || 'probe failed');
+      imgW = p.w; imgH = p.h;
+      srcImgEl = null;
+      viewerSetBefore(null);
+      $('mix').disabled = true;
+      $('mix').title = '浏览器解不出此格式, 无混合锚点 (客户端混合需要浏览器可解码原图)';
+      $('previewNote').textContent = '此格式浏览器无法预览原图，对比视图仅显示超分结果';
+      const bitsTag = p.bits > 8 ? ` ${p.bits}bit${p.hdr ? ' HDR' : ''}` : '';
+      $('pickInfo').textContent =
+        `${file.name} · ${p.fmt}${bitsTag} ${imgW}×${imgH} → ${imgW*SR_SCALE}×${imgH*SR_SCALE} · ${estTiles(imgW, imgH, SR_SCALE)} tiles`;
+      $('run').disabled = false;
+    }).catch(err => setStatus('无法读取该文件: ' + err.message));
   };
   img.src = beforeURL;
 }
 
-// 预览图上限 (长边像素). 与 CSS 宽度 1200 * 2(dpr) 对齐, 浏览器只需 1:1 贴图.
-// 浏览器把上亿字节/几千万像素的大图缩到屏幕尺寸时会走低质量下采样 (mipmap/LOD),
-// 在平滑区 (天空/水面) 会显出 448px 的块状明暗差 —— 文件本身没有问题, 只是显示路径太粗糙。
-// 这里先用 canvas 分级减半做高质量缩小, 拿到一张天然尺寸合适的小图, 浏览器就不用再缩放。
-const PREVIEW_MAX = 2400;
+// ============ 实时进度 ============
+// 只报 tile 计数与实测速率, 不做时间预估
+const STAGE_NAMES = { 0: 'VAE 编码', 1: 'Transformer', 2: 'VAE 解码' };   // stage 3 在此映射之前已单独处理
+let pollTimer = null;
+function pollProgress() {
+  fetch('/api/progress').then(r => r.json()).then(d => {
+    if (d.total <= 0) return;                       // 任务还没起
+    if (d.stage === 3) {
+      $('progfill').style.width = '100%';
+      $('progtext').textContent = '后处理（色彩对齐 / 残差回注 / 编码）…';
+      return;
+    }
+    const f = d.done / d.total;                     // done/total 已是全局 stage-tile 计数
+    const rate = d.elapsed_ms > 800 ? d.done / (d.elapsed_ms / 1000) : 0;
+    $('progfill').style.width = (100 * f).toFixed(1) + '%';
+    const name = STAGE_NAMES[d.stage] ?? '';
+    $('progtext').textContent = `${name} · ${d.done}/${d.total}` +
+      (rate > 0 ? ` · 实测 ${rate.toFixed(2)} tile/s` : '');
+  }).catch(() => {});
+}
 
+// ============ 预览缩小 (供查看器在"适应"档画出无锯齿的全图) ============
+const PREVIEW_MAX = 2400;
 function loadImage(url) {
   return new Promise((res, rej) => {
     const i = new Image();
@@ -145,74 +268,254 @@ function loadImage(url) {
     i.src = url;
   });
 }
+function downscaleToCanvas(img, maxEdge) {
+  const w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
+  const k = Math.min(1, maxEdge / Math.max(w, h));
+  if (k >= 0.999) return null;
+  const tw = Math.round(w * k), th = Math.round(h * k);
+  const draw = (src, nw, nh) => {
+    const c = document.createElement('canvas');
+    c.width = nw; c.height = nh;
+    const ctx = c.getContext('2d');
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(src, 0, 0, nw, nh);
+    return c;
+  };
+  let cur = draw(img, Math.min(w, tw * 2), Math.min(h, th * 2));
+  while (cur.width / 2 > tw) cur = draw(cur, Math.round(cur.width / 2), Math.round(cur.height / 2));
+  return (cur.width !== tw || cur.height !== th) ? draw(cur, tw, th) : cur;
+}
 
-async function makePreviewURL(img, fallbackURL) {
-  const w = img.naturalWidth, h = img.naturalHeight;
-  const k = Math.min(1, PREVIEW_MAX / Math.max(w, h));
-  if (k >= 0.999) return fallbackURL;
+// ============ 缩放/平移/对比查看器 ============
+// 状态: z = 屏幕px / 图像px; (ox,oy) = 画布左上角在图像坐标系的位置; div = 分割线 (图像宽度占比 0..1)
+const V = { z: 1, ox: 0, oy: 0, div: 0.5, before: null, after: null, beforePrev: null, afterPrev: null };
+const cv = $('cv'), ctx = cv.getContext('2d');
+const dpr = Math.max(1, window.devicePixelRatio || 1);
+
+function vSrcFor(img, prev) {
+  // 缩得太小时用预缩小图 (自带高质量 mipmap 链), 放大后用原图 (真 1:1 像素)
+  const maxdim = Math.max(img.naturalWidth, img.naturalHeight);
+  return (V.z <= PREVIEW_MAX / maxdim && prev) ? prev : img;
+}
+function vDraw() {
+  const img = V.after; if (!img) return;
+  const Wc = cv.clientWidth, Hc = cv.clientHeight;
+  if (cv.width !== Math.round(Wc * dpr) || cv.height !== Math.round(Hc * dpr)) {
+    cv.width = Math.round(Wc * dpr); cv.height = Math.round(Hc * dpr);
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, Wc, Hc);
+  const iw = img.naturalWidth, ih = img.naturalHeight;
+
+  const drawLayer = (imgEl, prev, clipX) => {
+    if (!imgEl) return;                                     // 浏览器解不出的格式 (DNG 等): 该层留白
+    const src = vSrcFor(imgEl, prev);
+    const kp = (src.naturalWidth || src.width) / iw;        // 源图像素 / 逻辑图像像素 (canvas 无 naturalWidth)
+    const ix0 = Math.max(0, V.ox), iy0 = Math.max(0, V.oy);
+    const ix1 = Math.min(iw, V.ox + Wc / V.z), iy1 = Math.min(ih, V.oy + Hc / V.z);
+    if (ix1 <= ix0 || iy1 <= iy0) return;
+    if (clipX !== null) {
+      ctx.save();
+      ctx.beginPath(); ctx.rect(0, 0, clipX, Hc); ctx.clip();   // 原图裁在分割线左侧
+    }
+    ctx.imageSmoothingEnabled = V.z * dpr < 1;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(src, ix0 * kp, iy0 * kp, (ix1 - ix0) * kp, (iy1 - iy0) * kp,
+                  (ix0 - V.ox) * V.z, (iy0 - V.oy) * V.z, (ix1 - ix0) * V.z, (iy1 - iy0) * V.z);
+    if (clipX !== null) ctx.restore();
+  };
+  const divX = (iw * V.div - V.ox) * V.z;
+  drawLayer(V.after, V.afterPrev, null);                    // 超分铺底
+  drawLayer(V.before, V.beforePrev, Math.max(0, divX));     // 原图裁在分割线左侧
+  // 分割线 (DOM 元素, 跟手)
+  const line = $('divline');
+  line.style.left = Math.round(divX) + 'px';
+  line.style.display = (divX > -50 && divX < Wc + 50) ? 'block' : 'none';
+  $('vhint').textContent = `${Math.round(V.z * 100)}%`;
+}
+function vFit() {
+  const img = V.after || V.before; if (!img) return;
+  const iw = img.naturalWidth, ih = img.naturalHeight;
+  const Wc = cv.clientWidth, Hc = cv.clientHeight;
+  V.z = Math.min(Wc / iw, Hc / ih);
+  V.ox = (iw - Wc / V.z) / 2;
+  V.oy = (ih - Hc / V.z) / 2;
+  vDraw();
+}
+function vZoomAt(f, mx, my) {   // (mx,my) = 画布 CSS 坐标, 缩放前后该点图像坐标不动
+  const zmin = Math.min(cv.clientWidth / 32, 0.02), zmax = 8;
+  const ix = V.ox + mx / V.z, iy = V.oy + my / V.z;
+  V.z = Math.min(zmax, Math.max(zmin, V.z * f));
+  V.ox = ix - mx / V.z;
+  V.oy = iy - my / V.z;
+  vDraw();
+}
+function viewerSetBefore(img) { V.before = img; V.beforePrev = img ? downscaleToCanvas(img, PREVIEW_MAX) : null; if (V.after) vFit(); else vDraw(); }
+
+// 交互
+let drag = null;
+const viewer = $('viewer');
+viewer.addEventListener('pointerdown', e => {
+  if (e.target.closest('.zoombar')) return;
+  viewer.setPointerCapture(e.pointerId);
+  const r = viewer.getBoundingClientRect();
+  const mx = e.clientX - r.left, my = e.clientY - r.top;
+  const img = V.after; if (!img) return;
+  const divX = (img.naturalWidth * V.div - V.ox) * V.z;
+  if (Math.abs(mx - divX) < 14) { drag = { mode: 'div' }; viewer.classList.add('col-resizing'); }
+  else { drag = { mode: 'pan', mx, my, ox: V.ox, oy: V.oy }; viewer.classList.add('panning'); }
+});
+viewer.addEventListener('pointermove', e => {
+  const r = viewer.getBoundingClientRect();
+  const mx = e.clientX - r.left, my = e.clientY - r.top;
+  if (!drag) {  // 悬停光标提示
+    const img = V.after; if (!img) return;
+    const divX = (img.naturalWidth * V.div - V.ox) * V.z;
+    viewer.classList.toggle('col-resizing', Math.abs(mx - divX) < 14);
+    return;
+  }
+  if (drag.mode === 'pan') {
+    V.ox = drag.ox - (mx - drag.mx) / V.z;
+    V.oy = drag.oy - (my - drag.my) / V.z;
+  } else if (drag.mode === 'div') {
+    const img = V.after;
+    V.div = Math.min(1, Math.max(0, (V.ox + mx / V.z) / img.naturalWidth));
+  }
+  vDraw();
+});
+viewer.addEventListener('pointerup', e => { drag = null; viewer.classList.remove('panning', 'col-resizing'); });
+viewer.addEventListener('pointercancel', () => { drag = null; viewer.classList.remove('panning', 'col-resizing'); });
+viewer.addEventListener('wheel', e => {
+  e.preventDefault();
+  const r = viewer.getBoundingClientRect();
+  vZoomAt(e.deltaY < 0 ? 1.25 : 1 / 1.25, e.clientX - r.left, e.clientY - r.top);
+}, { passive: false });
+viewer.addEventListener('dblclick', () => vFit());
+window.addEventListener('resize', vDraw);
+$('zFit').addEventListener('click', vFit);
+$('z100').addEventListener('click', () => {
+  const img = V.after; if (!img) return;
+  const Wc = cv.clientWidth, Hc = cv.clientHeight;
+  const cx = V.ox + Wc / V.z / 2, cy = V.oy + Hc / V.z / 2;   // 保持中心
+  V.z = 1;
+  V.ox = cx - Wc / 2; V.oy = cy - Hc / 2;
+  vDraw();
+});
+$('zIn').addEventListener('click', () => vZoomAt(1.25, cv.clientWidth / 2, cv.clientHeight / 2));
+$('zOut').addEventListener('click', () => vZoomAt(1 / 1.25, cv.clientWidth / 2, cv.clientHeight / 2));
+
+// ============ 主流程 ============
+// 混合强度: 客户端重混 —— 复用上次超分缓存与原生插值锚点 (原图高质量放大),
+// 逐像素 out = m*sr + (1-m)*anchor, 不重新推理。100% 直接还原缓存, 零损耗。
+let SR_CACHE = null;               // { src, srImg, srURL, scale }
+let mixBusy = false, mixQueued = false;
+const EXT_OF = { png: 'png', jpg: 'jpg', webp: 'webp', avif: 'avif', bmp: 'bmp' };
+
+function setStatusMixApplied() {
+  const v = +$('mix').value;
+  setStatus(`混合强度 ${v}% · ${v >= 100 ? '全超分（缓存直出）' : '已复用上次超分结果重新混合'}`);
+}
+
+async function applyMix() {
+  if (!SR_CACHE || $('mix').disabled) return;
+  if (mixBusy) { mixQueued = true; return; }
+  mixBusy = true;
   try {
-    const tw = Math.round(w * k), th = Math.round(h * k);
-    const draw = (src, nw, nh) => {
-      const c = document.createElement('canvas');
-      c.width = nw; c.height = nh;
-      const ctx = c.getContext('2d');
-      ctx.imageSmoothingEnabled = true;
-      ctx.imageSmoothingQuality = 'high';
-      ctx.drawImage(src, 0, 0, nw, nh);
-      return c;
-    };
-    let cur = draw(img, Math.min(w, tw * 2), Math.min(h, th * 2));   // 第一刀 ≤2x
-    while (cur.width / 2 > tw) cur = draw(cur, Math.round(cur.width / 2), Math.round(cur.height / 2));
-    const out = (cur.width !== tw || cur.height !== th) ? draw(cur, tw, th) : cur;
-    const blob = await new Promise(res => out.toBlob(res, 'image/png'));
-    return blob ? URL.createObjectURL(blob) : fallbackURL;
-  } catch (e) {
-    return fallbackURL;   // canvas 失败就退回原图 (最坏情况只是显示粗糙)
+    const v = +$('mix').value, m = v / 100;
+    let url, pic;
+    if (m >= 0.999) {                       // 全超分: 直接用缓存原图, 不重编码
+      url = SR_CACHE.srURL; pic = SR_CACHE.srImg;
+    } else {
+      setStatusMixApplied();
+      const W = SR_CACHE.srImg.naturalWidth, H = SR_CACHE.srImg.naturalHeight;
+      const a = document.createElement('canvas'); a.width = W; a.height = H;
+      const ac = a.getContext('2d');
+      ac.imageSmoothingEnabled = true; ac.imageSmoothingQuality = 'high';
+      ac.drawImage(SR_CACHE.src, 0, 0, W, H);          // 插值锚点
+      const s = document.createElement('canvas'); s.width = W; s.height = H;
+      s.getContext('2d').drawImage(SR_CACHE.srImg, 0, 0);
+      const ad = ac.getImageData(0, 0, W, H), sd = s.getContext('2d').getImageData(0, 0, W, H);
+      const A = ad.data, S = sd.data;
+      for (let i = 0; i < A.length; i += 4) {
+        A[i]     = m * S[i]     + (1 - m) * A[i];
+        A[i + 1] = m * S[i + 1] + (1 - m) * A[i + 1];
+        A[i + 2] = m * S[i + 2] + (1 - m) * A[i + 2];
+        A[i + 3] = 255;
+      }
+      ac.putImageData(ad, 0, 0);
+      const blob = await new Promise(res => a.toBlob(res, 'image/png'));
+      url = URL.createObjectURL(blob);
+      pic = await loadImage(url);
+    }
+    if (previewURL && previewURL !== SR_CACHE.srURL) URL.revokeObjectURL(previewURL);
+    $('imgFull').src = url; previewURL = url;
+    $('dl').href = url;
+    $('dl').download = (file.name.replace(/\.[^.]+$/, '') || 'tinysr') +
+      `_${SR_CACHE.scale}x.${EXT_OF[$('fmt').value]}`;
+    V.after = pic;
+    V.afterPrev = downscaleToCanvas(pic, PREVIEW_MAX);
+    vDraw();
+    if (m >= 0.999) setStatusMixApplied();
+  } finally {
+    mixBusy = false;
+    if (mixQueued) { mixQueued = false; applyMix(); }
   }
 }
+$('mix').addEventListener('change', applyMix);
 
 $('run').addEventListener('click', async () => {
   if (!file) return;
   $('run').disabled = true;
   const t0 = performance.now();
-  const tiles = estTiles(imgW, imgH);
-  const per = $('backend').value === 'vulkan' ? 0.36 : 1.9;  // 实测每 tile 秒数
-  setStatus(`<span class="spinner"></span>推理中…（${tiles} tiles，预计 ~${Math.max(1, Math.round(tiles * per + 3))}s）`);
+  const tiles = estTiles(imgW, imgH, SR_SCALE);
+  setStatus(`<span class="spinner"></span>推理中…（${tiles} tiles）`);
+  $('prog').hidden = false;
+  $('progfill').style.width = '0%';
+  $('progtext').textContent = '上传中…';
+  pollTimer = setInterval(pollProgress, 400);
   const fd = new FormData();
   fd.append('image', file);
   fd.append('backend', $('backend').value);
+  fd.append('scale', String(SR_SCALE));
+  fd.append('fmt', $('fmt').value);
   try {
     const r = await fetch('/api/sr', { method: 'POST', body: fd });
     if (!r.ok) throw new Error(await r.text());
+    clearInterval(pollTimer);
     const blob = await r.blob();
-    const url = URL.createObjectURL(blob);            // 原图: 只给下载, 预览不用它
+    const url = URL.createObjectURL(blob);
     const pic = await loadImage(url);
     const dims = `${pic.naturalWidth}×${pic.naturalHeight}`;
-    const view = await makePreviewURL(pic, url);      // 预览: 预先高质量缩小
-    if (previewURL) URL.revokeObjectURL(previewURL);
-    previewURL = (view !== url) ? view : null;
-    $('imgAfter').src = view;
-    $('imgFull').src = view;
-    $('dl').href = url;
     $('dims').textContent = dims;
-    // 对比框按结果比例撑开 (默认 66% 只是占位)
-    $('slider').querySelector('.frame').style.paddingTop = (imgH * 4 / (imgW * 4) * 100).toFixed(2) + '%';
-    $('dl').download = (file.name.replace(/\.[^.]+$/, '') || 'tinysr') + '_4x.png';
-    $('previewNote').textContent = (view !== url) ? ` · 预览缩放至 ${PREVIEW_MAX}px（下载为原分辨率）` : '';
+    SR_CACHE = { src: srcImgEl, srImg: pic, srURL: url, scale: SR_SCALE };
+    // HDR / 高位深结果不做客户端混合: canvas ImageData 只有 8-bit, 混了会降质
+    const mixOk = !!srcImgEl && r.headers.get('X-Hdr') !== '1' &&
+                  +(r.headers.get('X-Bit-Depth') || 8) <= 8;
+    $('mix').disabled = !mixOk;
+    $('mix').title = mixOk ? '' : 'HDR/高位深结果不做客户端混合 (canvas 仅 8-bit 精度)';
+    if (previewURL && previewURL !== url) URL.revokeObjectURL(previewURL);
+    $('imgFull').src = url; previewURL = url;
+    $('dl').href = url;
+    $('dl').download = (file.name.replace(/\.[^.]+$/, '') || 'tinysr') +
+      `_${SR_SCALE}x.${EXT_OF[$('fmt').value]}`;
+    $('previewNote').textContent = '';
     $('views').hidden = false;
+    V.after = pic;
+    V.afterPrev = downscaleToCanvas(pic, PREVIEW_MAX);
+    vFit();
     const srv = r.headers.get('X-Elapsed-Ms');
     const total = ((performance.now() - t0) / 1000).toFixed(2);
     setStatus(`完成 · 服务端 ${srv ? (+srv / 1000).toFixed(2) + 's' : '?'} · 端到端 ${total}s`);
+    if (+$('mix').value < 100 && !$('mix').disabled) await applyMix();   // 下拉不是 100%: 立即按当前强度重混
     $('views').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   } catch (err) {
     setStatus('失败: ' + err.message);
   } finally {
+    clearInterval(pollTimer);
+    setTimeout(() => { $('prog').hidden = true; }, 1500);
     $('run').disabled = false;
   }
-});
-
-$('range').addEventListener('input', e => {
-  $('imgAfter').style.clipPath = `inset(0 ${100 - e.target.value}% 0 0)`;
 });
 </script>
 </body>

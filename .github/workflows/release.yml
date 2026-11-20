@@ -28,9 +28,9 @@ jobs:
         shell: bash
         run: bash tools/setup_third_party.sh
 
-      - name: install Vulkan headers/loader (Linux)
+      - name: install Vulkan headers/loader + image format libs (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libvulkan-dev
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libvulkan-dev libwebp-dev libtiff-dev libavif-dev libraw-dev
 
       - name: install Vulkan SDK (Windows)
         if: runner.os == 'Windows'

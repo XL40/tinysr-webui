@@ -63,6 +63,46 @@ if(WIN32)
   target_link_libraries(tinysr-webui PRIVATE ws2_32)  # httplib
 endif()
 
+# ---- 可选图像格式 (系统库, 缺哪个禁哪个, 不阻塞构建) ----
+# 全部免版税/开源许可: libwebp / libtiff / libavif(含 AV1, HDR) / LibRaw(仅 DNG)。
+# HEIC/HEIF 不做: HEVC 专利池收费, 与"只做免版税格式"原则冲突。
+find_package(PkgConfig QUIET)
+# function 作用域隔离每次探测; pkg-config 命中用 IMPORTED_TARGET (携带 include+lib,
+# 链接空列表会显式报错而不是静默失败), 未命中退回 find_path/find_library。
+function(tinysr_fmt name define)
+  cmake_parse_arguments(FMT "" "HEADER" "PKGCFG;LIBNAMES" ${ARGN})
+  set(TINYSR_FMT_LINK "")
+  if(PKG_CONFIG_FOUND)
+    foreach(pc IN LISTS FMT_PKGCFG)
+      pkg_check_modules(PC_${name} IMPORTED_TARGET QUIET ${pc})
+      if(PC_${name}_FOUND)
+        set(TINYSR_FMT_LINK PkgConfig::PC_${name})
+        break()
+      endif()
+    endforeach()
+  endif()
+  if(NOT TINYSR_FMT_LINK)
+    # cache 变量名按格式唯一化: 共享名会在 CMP0126 新行为下被上一次调用的 cache 结果污染
+    find_path(TINYSR_FMT_INC_${name} ${FMT_HEADER} QUIET)
+    find_library(TINYSR_FMT_LIB_${name} NAMES ${FMT_LIBNAMES} QUIET)
+    if(TINYSR_FMT_INC_${name} AND TINYSR_FMT_LIB_${name})
+      set(TINYSR_FMT_LINK ${TINYSR_FMT_LIB_${name}})
+      target_include_directories(tinysr-webui PRIVATE ${TINYSR_FMT_INC_${name}})
+    endif()
+  endif()
+  if(TINYSR_FMT_LINK)
+    target_compile_definitions(tinysr-webui PRIVATE ${define})
+    target_link_libraries(tinysr-webui PRIVATE ${TINYSR_FMT_LINK})
+    message(STATUS "tinysr: ${name} support ON")
+  else()
+    message(STATUS "tinysr: ${name} support OFF")
+  endif()
+endfunction()
+tinysr_fmt(WebP TINYSR_HAVE_WEBP HEADER webp/encode.h LIBNAMES webp PKGCFG libwebp)
+tinysr_fmt(TIFF TINYSR_HAVE_TIFF HEADER tiffio.h LIBNAMES tiff PKGCFG libtiff-4)
+tinysr_fmt(AVIF TINYSR_HAVE_AVIF HEADER avif/avif.h LIBNAMES avif PKGCFG libavif)
+tinysr_fmt(DNG  TINYSR_HAVE_DNG  HEADER libraw/libraw.h LIBNAMES raw_r raw PKGCFG libraw_r libraw)
+
 # 前端单文件拷到构建目录, server 启动时读取
 add_custom_command(TARGET tinysr-webui POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_directory

@@ -1,12 +1,9 @@
 // TinySR ncnn 推理引擎
-// 语义对齐官方 PyTorch 实现 (已与 CPU fp32 金标准数值对拍):
-//   bicubic 4x -> [-1,1] -> vae.encode(512px tile)
+// 管线: bicubic 放大 -> [-1,1] -> vae.encode(512px tile)
 //   -> transformer(64 latent tile, IR 输出 = z - pred)
-//   -> vae.decode(64 latent tile) -> adain 色彩对齐 -> 亮度分布匹配
-// 三个阶段共用 64-latent tile 网格 + 余弦窗融合 (无网格缝)
-// tile 间另有 DC 对齐: transformer 的全 tile 注意力会让每个 tile 的平均亮度
-// 随内容漂移 ~0.5/255 (平滑/暗部区域可见 banding), 用 bicubic 参考逐 tile 锚定。
-// 后端: Vulkan GPU (fp16 storage) / CPU, 由 ncnn opt 切换
+//   -> vae.decode(64 latent tile) -> adain 色彩对齐 -> tonefix -> residfix -> flatgate
+// 三阶段共用 latent tile 网格 + 余弦窗融合 (无网格缝); dcfix 逐 tile 锚定亮度。
+// 后端: Vulkan GPU (fp16 storage) / CPU
 #pragma once
 #include <cstdint>
 #include <functional>
@@ -22,12 +19,9 @@ struct Config {
   int threads = 0;                    // 0 = auto (硬件并发)
   int fp16 = 2;                       // Vulkan 下: 0=关, 1=仅 fp16 存储, 2=存储+运算
   int overlap = 8;                    // tile 重叠 (latent 单位, 1 latent = 8 px)
-  int phase = 0;                      // 网格相位偏移 (latent), 二次相位推理用
   int dcfix = 1;                      // 逐 tile DC 对齐 (消 tile 间亮度台阶)
   int tonefix = 1;                    // 亮度分布匹配 (消模型整体曝光偏移, 如暗部提亮)
-  int ocm = 0;                        // overlap color matching: 与已写入画布在重叠区做 mean/std 对齐
-  int mb = 0;                         // multiband blending: 低频宽窗缓变, 高频窄窗
-  int win = 0;                        // 融合窗: 0/1=互补余弦坡 (数值等价) 2=Hann 剖面
+  int flatgate = 1;                   // 平坦区细节门控: 证据检测 + 频段抑制 + 预算钳制
   int resid = 1;                      // 精确残差回注 (低频带对齐原图, fp32)
   int resid_r = 4;                    // 残差低通: 盒式模糊半径 (原图域 px, 3 遍 ≈ σ=r)
   float resid_alpha = 1.0f;           // 残差强度
@@ -41,25 +35,32 @@ class Engine {
   ~Engine();
   bool init(const Config& cfg);
 
-  // rgb: RGB8, 行主序, w*3 每行
-  // 成功后 out = RGB8 尺寸 (w*scale, h*scale)
-  bool upscale(const uint8_t* rgb, int w, int h, int scale,
-               const std::function<void(int stage, int done, int total)>& progress,
-               std::vector<uint8_t>& out, int& ow, int& oh);
+  // 单一推理入口: 输入 [0,1] fp32 RGB (8/16-bit 源由调用方归一), 输出同域 RGB。
+  // hdr=true: 源为 PQ/HLG 感知码域 —— 跳过 SDR 专用校准 (tonefix), 输出保持同域同位深。
+  bool upscale_f(const float* rgb01, int w, int h, int scale,
+                 const std::function<void(int stage, int done, int total)>& progress,
+                 std::vector<float>& out01, int& ow, int& oh, bool hdr = false);
 
   bool vulkan_enabled() const { return vulkan_; }
 
  private:
+  // 单遍推理: 网格构建 + encode/transformer/decode + 后处理 + 尺寸对齐。
+  bool upscale_pass(const float* rgb01, int w,
+                    int h, int nw, int nh, int ow, int oh, int pW, int pH, int lt_h,
+                    int lt_w, const std::vector<float>& pixel,
+                    const std::vector<float>& bigf, const std::vector<uint8_t>& gluma,
+                    const double* s_mean, const double* s_std,
+                    const std::function<void(int stage, int done, int total)>& progress,
+                    std::vector<float>& pass_out, bool hdr = false);
+
   std::unique_ptr<Net> enc_, tr_, dec_;
   bool vulkan_ = false;
   int threads_ = 0;
   int overlap_ = 8;
-  int phase_ = 0;
   int dcfix_ = 1;
   int tonefix_ = 1;
-  int ocm_ = 0;
-  int mb_ = 0;
-  int win_ = 0;
+  int flatgate_ = 1;
+  std::vector<float> fg_mo_;   // flatgate: LR 域证据图上采样到画布尺寸 (0=保护 1=平坦)
   int resid_ = 1;
   int resid_r_ = 4;
   float resid_alpha_ = 1.0f;

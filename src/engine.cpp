@@ -79,55 +79,30 @@ inline float ramp01(float v) {
 }
 
 // 一维融合权重 (长度 t)。重叠区用互补斜坡, 相邻两块在重叠区权重和恰为 1,
-// 因此没有任何像素的被除数接近 0, 且过渡宽度 = 整个重叠区 (而不是窄高斯的中段)。
+// 因此没有任何像素的被除数接近 0, 且过渡宽度 = 整个重叠区。
 // edge_lo / edge_hi: 该 tile 的这条边是否贴图像边界 (贴边时不衰减, 因为对面没有 tile)。
-// win: 0/1 = 互补余弦坡 (数值等价, 0 默认), 
-//      2 = Hann 剖面 (半个 tile 宽度渐起渐落, 依赖 contrib 归一化)。
-std::vector<float> axis_window(int t, int overlap, bool edge_lo, bool edge_hi, int win = 0) {
+std::vector<float> axis_window(int t, int overlap, bool edge_lo, bool edge_hi) {
   std::vector<float> w((size_t)t);
-  const float half = t * 0.5f;
   for (int u = 0; u < t; u++) {
-    float a, b;
-    if (win == 2) {
-      // Hann 剖面: 从每条边起半个 tile 宽度渐起, 中部恒 1
-      auto side = [&](float d, bool edge) {
-        if (edge) return 1.f;
-        return d >= half ? 1.f : 0.5f - 0.5f * std::cos(kPi() * (d + 0.5f) / half);
-      };
-      a = side(float(u), edge_lo);
-      b = side(float(t - 1 - u), edge_hi);
-      w[(size_t)u] = a * b;
-      continue;
-    }
-    auto fade = [&](float x) {
-      x = ramp01(x);
-      return win == 1 ? 0.5f - 0.5f * std::cos(kPi() * x) : x;
-    };
-    a = edge_lo ? 1.f : fade((u + 0.5f) / (float)overlap);
-    b = edge_hi ? 1.f : fade((t - u - 0.5f) / (float)overlap);
+    auto fade = [](float x) { return ramp01(x); };
+    const float a = edge_lo ? 1.f : fade((u + 0.5f) / (float)overlap);
+    const float b = edge_hi ? 1.f : fade((t - u - 0.5f) / (float)overlap);
     w[(size_t)u] = std::min(a, b);
   }
   return w;
 }
 
 struct TileGrid {
-  // 注意: 成员按声明顺序初始化, step 必须在 rows/cols 之前
+  // 成员按声明顺序初始化, step 必须在 rows/cols 之前
   int lh, lw, step, rows, cols;
-  std::vector<int> ys, xs;   // 去重后的 tile 起点 (latent)
-  // phase: 网格相位偏移 (latent), 用于"偏移网格二次推理取平均"实验。
-  // phase=0 时与旧实现完全一致; phase>0 时额外补一块贴 0 起点, 保证顶/左覆盖。
-  TileGrid(int latent_h, int latent_w, int overlap, int phase = 0)
+  std::vector<int> ys, xs;   // tile 起点 (latent)
+  TileGrid(int latent_h, int latent_w, int overlap)
       : lh(latent_h), lw(latent_w), step(kTile - overlap), rows(1), cols(1) {
     auto starts = [&](int n) {
       std::vector<int> v;
       const int last = n - kTile;
-      for (int raw = phase; raw <= last; raw += step) {
-        v.push_back(raw);
-        if (phase > 0 && raw == phase) v.push_back(0);   // 相位网格补首块 (覆盖 [0, phase))
-      }
+      for (int raw = 0; raw <= last; raw += step) v.push_back(raw);
       if (v.empty() || v.back() + kTile < n) v.push_back(std::max(last, 0));
-      std::sort(v.begin(), v.end());
-      v.erase(std::unique(v.begin(), v.end()), v.end());
       return v;
     };
     ys = starts(latent_h);
@@ -205,8 +180,7 @@ void box_blur_chw(const std::vector<float>& in, std::vector<float>& out, int c, 
 bool run_net(Net& n, const float* in, int ic, int ih, int iw, std::vector<float>& out,
              int& oc, int& oh, int& ow) {
   ncnn::Extractor ex = n.net.create_extractor();
-  // 注意: Extractor::input 只保存 Mat 的浅引用, 临时对象会在语句结束时析构 ->
-  // 必须让输入 Mat 活到 extract() 之后 (同 Python binding 必须 .clone() 的坑)
+  // Extractor::input 只保存浅引用: 输入 Mat 必须活到 extract() 之后
   const ncnn::Mat in_mat = chw_to_mat(in, ic, ih, iw);
   ex.input("in0", in_mat);
   ncnn::Mat m;
@@ -225,12 +199,9 @@ bool Engine::init(const Config& cfg) {
   vulkan_ = cfg.vulkan;
   threads_ = cfg.threads;
   overlap_ = std::clamp(cfg.overlap, 2, kTile / 2);
-  phase_ = std::clamp(cfg.phase, 0, kTile - 1);
-  win_ = std::clamp(cfg.win, 0, 2);
   dcfix_ = cfg.dcfix;
   tonefix_ = cfg.tonefix;
-  ocm_ = cfg.ocm;
-  mb_ = cfg.mb;
+  flatgate_ = cfg.flatgate;
   resid_ = cfg.resid;
   resid_r_ = std::clamp(cfg.resid_r, 1, 16);
   resid_alpha_ = cfg.resid_alpha;
@@ -247,52 +218,195 @@ bool Engine::init(const Config& cfg) {
   return true;
 }
 
-bool Engine::upscale(const uint8_t* rgb, int w, int h, int scale,
-                     const std::function<void(int, int, int)>& progress,
-                     std::vector<uint8_t>& out, int& ow, int& oh) {
+// ---- flatgate 辅助: 证据图 (LR 域 defocus 检测) + 频段金字塔 ----
+
+// 单通道 float 双线性采样 (坐标 clamp 到边界)
+static inline float bilin_s(const std::vector<float>& v, int w, int h, float y, float x) {
+  y = std::clamp(y, 0.f, (float)(h - 1));
+  x = std::clamp(x, 0.f, (float)(w - 1));
+  const int yi = (int)y, xi = (int)x;
+  const int yi1 = std::min(yi + 1, h - 1), xi1 = std::min(xi + 1, w - 1);
+  const float fy = y - yi, fx = x - xi;
+  return v[(size_t)yi * w + xi] * (1 - fx) * (1 - fy) + v[(size_t)yi * w + xi1] * fx * (1 - fy) +
+         v[(size_t)yi1 * w + xi] * (1 - fx) * fy + v[(size_t)yi1 * w + xi1] * fx * fy;
+}
+
+// 2x 降采样: box blur r=1 后抽奇偶 (与原型 box2d+[::2,::2] 同口径)
+static void down2_ch(const std::vector<float>& in, std::vector<float>& out, int h, int w,
+                     std::vector<float>& tmp) {
+  tmp.assign(in.size(), 0.f);
+  box_blur_chw(in, tmp, 1, h, w, 1);
+  const int H = (h + 1) / 2, W = (w + 1) / 2;
+  out.resize((size_t)H * W);
+  for (int y = 0; y < H; y++)
+    for (int x = 0; x < W; x++)
+      out[(size_t)y * W + x] = tmp[(size_t)std::min(y * 2, h - 1) * w + std::min(x * 2, w - 1)];
+}
+
+// 双线性重采样到任意目标尺寸 (金字塔上采样用)
+static void resample_ch(const std::vector<float>& in, std::vector<float>& out,
+                        int h, int w, int H, int W) {
+  out.resize((size_t)H * W);
+  for (int y = 0; y < H; y++) {
+    const float fy = (y + 0.5f) * (float)h / H - 0.5f;
+    for (int x = 0; x < W; x++) {
+      const float fx = (x + 0.5f) * (float)w / W - 0.5f;
+      out[(size_t)y * W + x] = bilin_s(in, w, h, fy, fx);
+    }
+  }
+}
+
+bool Engine::upscale_f(const float* rgb01, int w, int h, int scale,
+                       const std::function<void(int, int, int)>& progress,
+                       std::vector<float>& out01, int& ow, int& oh, bool hdr) {
   if (!enc_) return false;
 
-  // ---- 1. bicubic 放大 + [-1,1] 归一化 + pad 到 512 倍数 ----
+  // ---- 1. bicubic 放大 + pad 到 512 倍数 (全程 [0,1] fp32, 8/16-bit 量化只在 I/O 边界) ----
   const int nw = (w * scale / 8) * 8, nh = (h * scale / 8) * 8;  // 8 对齐 (模型要求)
   ow = w * scale; oh = h * scale;
-  std::vector<uint8_t> big8((size_t)nw * nh * 3);
-  if (!stbir_resize_uint8_linear(rgb, w, h, w * 3, big8.data(), nw, nh, nw * 3, STBIR_RGB)) {
+  std::vector<float> bigf((size_t)nw * nh * 3);
+  if (!stbir_resize_float_linear(rgb01, w, h, w * 3 * (int)sizeof(float),
+                                 bigf.data(), nw, nh, nw * 3 * (int)sizeof(float), STBIR_RGB)) {
     fprintf(stderr, "[sr] upscale resize failed %dx%d -> %dx%d\n", w, h, nw, nh);
     return false;
   }
   const int pH = (nh + 511) / 512 * 512, pW = (nw + 511) / 512 * 512;
   std::vector<float> pixel((size_t)pH * pW * 3, 0.f);
-  // adain 的 style 参考 = bicubic 4x 放大后的 LR (即参考实现里的 lr_for_align),
-  // 这里直接在同一批 bicubic 结果上统计, 省一次重采样
-  // tonefix 还需要 bicubic 亮度的 256 级直方图 (LUT 的目标分布), 同一趟顺便统计
+  // 同一趟 bicubic 结果上统计: adain 的 style 参考 (lr_for_align) 的 mean/std,
+  // 以及 tonefix 需要的 8-bit 亮度直方图
   double s_sum[3] = {0, 0, 0}, s_sq[3] = {0, 0, 0};
-  // tonefix 需要 bicubic 参考的亮度 (uint8, 0..255) 做条件偏置修正
   std::vector<uint8_t> gluma((size_t)nw * nh);
   const double npx = (double)nw * nh;
   for (int y = 0; y < nh; y++)
-    for (int x = 0; x < nw; x++)
+    for (int x = 0; x < nw; x++) {
+      const size_t bi = ((size_t)y * nw + x) * 3;
       for (int ch = 0; ch < 3; ch++) {
-        const float v = big8[((size_t)y * nw + x) * 3 + ch] / 255.f;
+        const float v = bigf[bi + ch];
         pixel[((size_t)y * pW + x) * 3 + ch] = v * 2.f - 1.f;
         s_sum[ch] += v;
         s_sq[ch] += (double)v * v;
-        if (ch == 2)
-          gluma[(size_t)y * nw + x] =
-              (uint8_t)((299 * big8[((size_t)y * nw + x) * 3 + 0] +
-                         587 * big8[((size_t)y * nw + x) * 3 + 1] +
-                         114 * big8[((size_t)y * nw + x) * 3 + 2]) / 1000);
       }
+      gluma[(size_t)y * nw + x] = (uint8_t)std::clamp(
+          (int)std::lround((299.f * bigf[bi] + 587.f * bigf[bi + 1] + 114.f * bigf[bi + 2]) * 0.255f),
+          0, 255);
+    }
   double s_mean[3], s_std[3];
   for (int ch = 0; ch < 3; ch++) {
     s_mean[ch] = s_sum[ch] / npx;
     s_std[ch] = std::sqrt(std::max(0.0, s_sq[ch] / npx - s_mean[ch] * s_mean[ch]));
   }
 
+  // ---- 1.5 flatgate: LR 域 defocus 证据图 (每 job 一次) ----
+  // 在 LR 图上找清晰边缘证据 (脊线 NMS + 对比度阈值): 有证据 = 在焦, 保护模型细节;
+  // 远离证据的平坦区 = 虚化/纯渐变, 对模型新增内容做频段抑制 + 预算钳制。
+  // 相对判据 (有无证据) 而非绝对幅值: 活跃度幅值随退化程度整体平移, 不可跨图标定。
+  fg_mo_.clear();
+  if (flatgate_) {
+    const int cell = 24, prof = 4, dilate = 2;
+    std::vector<float> yl((size_t)w * h), gm((size_t)w * h);
+    for (size_t i = 0; i < yl.size(); i++)
+      yl[i] = (299.f * rgb01[i * 3 + 0] + 587.f * rgb01[i * 3 + 1] + 114.f * rgb01[i * 3 + 2]) / 1000.f;
+    for (int yy = 0; yy < h; yy++) {
+      const int y0 = std::max(yy - 1, 0), y1 = std::min(yy + 1, h - 1);
+      for (int xx = 0; xx < w; xx++) {
+        const int x0 = std::max(xx - 1, 0), x1 = std::min(xx + 1, w - 1);
+        const float gx = (yl[(size_t)yy * w + x1] - yl[(size_t)yy * w + x0]) * 0.5f;
+        const float gy = (yl[(size_t)y1 * w + xx] - yl[(size_t)y0 * w + xx]) * 0.5f;
+        gm[(size_t)yy * w + xx] = std::sqrt(gx * gx + gy * gy);
+      }
+    }
+    float thr = 0.02f;
+    {
+      std::vector<float> srt = gm;
+      const size_t idx = srt.size() * 88 / 100;
+      std::nth_element(srt.begin(), srt.begin() + idx, srt.end());
+      thr = std::max(srt[idx], 0.02f);
+    }
+    const int GH = (h + cell - 1) / cell, GW = (w + cell - 1) / cell;
+    std::vector<int> cnt((size_t)GH * GW, 0);
+    size_t ncand = 0;
+    for (float g : gm)
+      if (g > thr) ncand++;
+    const size_t stride = ncand > 60000 ? ncand / 60000 + 1 : 1;
+    size_t seen = 0;
+    for (int yy = 0; yy < h; yy++) {
+      const int ya = std::max(yy - 1, 0), yb = std::min(yy + 1, h - 1);
+      for (int xx = 0; xx < w; xx++) {
+        const size_t i = (size_t)yy * w + xx;
+        if (gm[i] <= thr) continue;
+        if ((seen++ % stride) != 0) continue;
+        const float g = gm[i];
+        const int xa = std::max(xx - 1, 0), xb = std::min(xx + 1, w - 1);
+        const float gx = (yl[(size_t)yy * w + xb] - yl[(size_t)yy * w + xa]) * 0.5f;
+        const float gy = (yl[(size_t)yb * w + xx] - yl[(size_t)ya * w + xx]) * 0.5f;
+        const float gn = std::max(g, 1e-6f);
+        const float ddx = gx / gn, ddy = gy / gn;
+        // 容差非极大抑制: 只取脊线附近 (profile 才居中)
+        if (g < 0.9f * bilin_s(gm, w, h, yy + ddy, xx + ddx)) continue;
+        if (g < 0.9f * bilin_s(gm, w, h, yy - ddy, xx - ddx)) continue;
+        // 沿梯度方向 ±4px profile, 对比度足够才算证据 (滤 JPEG 噪声伪边)
+        float ps[2 * 4 + 1], pmin = 1e9f, pmax = -1e9f;
+        for (int k = 0; k <= 2 * prof; k++) {
+          ps[k] = bilin_s(yl, w, h, yy + (k - prof) * ddy, xx + (k - prof) * ddx);
+          pmin = std::min(pmin, ps[k]);
+          pmax = std::max(pmax, ps[k]);
+        }
+        if (pmax - pmin <= 0.06f) continue;
+        cnt[(size_t)std::min(yy / cell, GH - 1) * GW + std::min(xx / cell, GW - 1)]++;
+      }
+    }
+    // 证据格 (>=4 样本) 膨胀 dilate 格: 证据附近的过渡带也算"在焦保护区"
+    std::vector<float> grid((size_t)GH * GW);
+    size_t n_ev = 0;
+    for (size_t i = 0; i < grid.size(); i++) {
+      grid[i] = cnt[i] >= 4 ? 1.f : 0.f;
+      n_ev += cnt[i] >= 4;
+    }
+    {
+      std::vector<float> gd;
+      box_blur_chw(grid, gd, 1, GH, GW, dilate);
+      for (size_t i = 0; i < grid.size(); i++) grid[i] = gd[i] > 0.01f ? 1.f : 0.f;
+    }
+    // 网格 -> 逐像素 M (0=保护 1=虚焦/平坦), 羽化。证据格取反: 有证据 => M=0。
+    std::vector<float> mlr((size_t)w * h);
+    for (int yy = 0; yy < h; yy++)
+      for (int xx = 0; xx < w; xx++)
+        mlr[(size_t)yy * w + xx] =
+            1.f - grid[(size_t)std::min(yy / cell, GH - 1) * GW + std::min(xx / cell, GW - 1)];
+    std::vector<float> mtmp;
+    box_blur_chw(mlr, mtmp, 1, h, w, cell / 2);
+    mlr.swap(mtmp);
+    fg_mo_.assign((size_t)nw * nh, 0.f);
+    if (!stbir_resize_float_linear(mlr.data(), w, h, w * (int)sizeof(float),
+                                   fg_mo_.data(), nw, nh, nw * (int)sizeof(float), STBIR_1CHANNEL))
+      fg_mo_.clear();
+    fprintf(stderr, "[sr] flatgate evidence cells %zu/%d (%.1f%%)\n",
+            n_ev, GH * GW, 100.0 * n_ev / ((double)GH * GW));
+  }
+
   const int lt_h = pH / 8, lt_w = pW / 8;
-  TileGrid grid(lt_h, lt_w, overlap_, phase_);
+  if (!upscale_pass(rgb01, w, h,
+                    nw, nh, ow, oh, pW, pH, lt_h, lt_w, pixel, bigf, gluma, s_mean,
+                    s_std, progress, out01, hdr))
+    return false;
+  std::vector<float>().swap(pixel);
+  return true;
+}
+
+// 单遍: 网格构建 + encode/transformer/decode + 后处理 + 尺寸对齐。
+bool Engine::upscale_pass(const float* rgb01,
+                          int w, int h, int nw, int nh, int ow, int oh, int pW, int pH,
+                          int lt_h, int lt_w, const std::vector<float>& pixel,
+                          const std::vector<float>& bigf, const std::vector<uint8_t>& gluma,
+                          const double* s_mean, const double* s_std,
+                          const std::function<void(int, int, int)>& progress,
+                          std::vector<float>& pass_out, bool hdr) {
+  TileGrid grid(lt_h, lt_w, overlap_);
   const int ov = overlap_;
-  fprintf(stderr, "[sr] grid %dx%d (step %d, overlap %d, phase %d), latent %dx%d\n",
-          grid.cols, grid.rows, grid.step, ov, phase_, lt_w, lt_h);
+  const double npx = (double)nw * nh;
+  fprintf(stderr,
+          "[sr] grid %dx%d (step %d, overlap %d), latent %dx%d\n",
+          grid.cols, grid.rows, grid.step, ov, lt_w, lt_h);
 
   // ---- 2. encode: 512px 窗口 -> 64x64 latent, 重叠区余弦融合 ----
   std::vector<float> latent((size_t)lt_h * lt_w * 16, 0.f), contrib((size_t)lt_h * lt_w, 0.f);
@@ -311,8 +425,8 @@ bool Engine::upscale(const uint8_t* rgb, int w, int h, int scale,
       int oc, ohh, oww;
       if (!run_net(*enc_, tile.data(), 3, 512, 512, l, oc, ohh, oww) || ohh != 64 || oww != 64)
         return false;
-      const auto wy = axis_window(kTile, ov, y == 0, y + kTile >= lt_h, win_);
-      const auto wx = axis_window(kTile, ov, x == 0, x + kTile >= lt_w, win_);
+      const auto wy = axis_window(kTile, ov, y == 0, y + kTile >= lt_h);
+      const auto wx = axis_window(kTile, ov, x == 0, x + kTile >= lt_w);
       for (int ch = 0; ch < 16; ch++)
         for (int yy = 0; yy < kTile; yy++)
           for (int xx = 0; xx < kTile; xx++) {
@@ -322,11 +436,10 @@ bool Engine::upscale(const uint8_t* rgb, int w, int h, int scale,
           }
       if (dump_tile("enc", r * grid.cols + c, l))
         fprintf(stderr, "[tile] enc %d %d %d %d\n", r * grid.cols + c, r, c, 0);
-      if (progress) progress(0, ++done, grid.count());
+      if (progress) progress(0, ++done, 3 * grid.count());
     }
   for (size_t i = 0; i < latent.size(); i++) latent[i] /= contrib[i % ((size_t)lt_h * lt_w)];
   dump_tensor("latent.bin", latent);
-  std::vector<float>().swap(pixel);
 
   // ---- 3. transformer: 融合结果即 hr_latent (= z - pred) ----
   std::vector<float> hr((size_t)lt_h * lt_w * 16, 0.f);
@@ -340,17 +453,17 @@ bool Engine::upscale(const uint8_t* rgb, int w, int h, int scale,
           std::copy(&latent[((size_t)ch * lt_h + y + yy) * lt_w + x],
                     &latent[((size_t)ch * lt_h + y + yy) * lt_w + x] + kTile,
                     &tile[((size_t)ch * kTile + yy) * kTile]);
-      std::vector<float> p;
+      std::vector<float> pred;
       int oc, ohh, oww;
-      if (!run_net(*tr_, tile.data(), 16, kTile, kTile, p, oc, ohh, oww)) return false;
-      const auto wy = axis_window(kTile, ov, y == 0, y + kTile >= lt_h, win_);
-      const auto wx = axis_window(kTile, ov, x == 0, x + kTile >= lt_w, win_);
+      if (!run_net(*tr_, tile.data(), 16, kTile, kTile, pred, oc, ohh, oww)) return false;
+      const auto wy = axis_window(kTile, ov, y == 0, y + kTile >= lt_h);
+      const auto wx = axis_window(kTile, ov, x == 0, x + kTile >= lt_w);
       for (int ch = 0; ch < 16; ch++)
         for (int yy = 0; yy < kTile; yy++)
           for (int xx = 0; xx < kTile; xx++)
             hr[(((size_t)ch * lt_h + y + yy) * lt_w + x + xx)] +=
-                p[((size_t)ch * 64 + yy) * 64 + xx] * wy[yy] * wx[xx];
-      if (progress) progress(1, ++done, grid.count());
+                pred[((size_t)ch * 64 + yy) * 64 + xx] * wy[yy] * wx[xx];
+      if (progress) progress(1, grid.count() + ++done, 3 * grid.count());
     }
   for (size_t i = 0; i < hr.size(); i++) hr[i] /= contrib[i % ((size_t)lt_h * lt_w)];
   dump_tensor("hr.bin", hr);
@@ -359,14 +472,7 @@ bool Engine::upscale(const uint8_t* rgb, int w, int h, int scale,
 
   // ---- 4. decode: 64x64 latent -> 512px 窗口, 重叠区余弦融合 ----
   std::vector<float> img((size_t)pH * pW * 3, 0.f), contrib2((size_t)pH * pW, 0.f);
-  std::vector<float> imgL, cL;  // multiband 低频带 (宽窗)
-  if (mb_) {
-    imgL.assign((size_t)pH * pW * 3, 0.f);
-    cL.assign((size_t)pH * pW, 0.f);
-  }
   float off_sum = 0.f, off_max = 0.f;       // dcfix 统计
-  double ocm_shift_sum = 0, ocm_gain_sum = 0;  // ocm 统计
-  long ocm_n = 0;
   done = 0;
   for (int r = 0; r < grid.rows; r++)
     for (int c = 0; c < grid.cols; c++) {
@@ -382,21 +488,22 @@ bool Engine::upscale(const uint8_t* rgb, int w, int h, int scale,
       if (!run_net(*dec_, tile.data(), 16, kTile, kTile, d, oc, ohh, oww) || ohh != 512 || oww != 512)
         return false;
       // ---- 逐 tile DC 对齐 (dcfix) ----
-      // transformer 对整块 64x64 latent 做全局注意力, 每个 tile 拿到的"全局语境"
-      // 不同, 输出的平均亮度会随 tile 内容漂移 (实测平滑区相邻 tile 台阶中位
-      // 0.5/255、p90 1.4/255, 暗部即肉眼可见的拼接块)。修法: 在该 tile 融合权重
-      // 恒为 1 的核心区, 统计它与 bicubic 参考 (=原曝光, 无 tile 结构) 的平均差,
-      // 整块平移后再融合。过渡仍由余弦窗完成, 不引入新台阶。
+      // 全局注意力使每个 tile 的输出亮度随内容漂移 (暗部呈拼接块)。
+      // 在融合权重恒为 1 的核心区统计与 bicubic 参考的平均差, 整块平移后融合。
       if (dcfix_) {
         const int ly0 = (y == 0) ? 0 : ov, ly1 = (y + kTile >= lt_h) ? kTile : kTile - ov;
         const int lx0 = (x == 0) ? 0 : ov, lx1 = (x + kTile >= lt_w) ? kTile : kTile - ov;
+        // bigf 是未 pad 的 nw×nh: 底/右边缘 tile 的采样窗必须裁进范围, 否则越界读
+        const int py_end = std::min(nh, (y + ly1) * 8);
+        const int px_end = std::min(nw, (x + lx1) * 8);
         double acc[3] = {0, 0, 0};
         long n = 0;
-        for (int yy = ly0 * 8; yy < ly1 * 8; yy++)
-          for (int xx = lx0 * 8; xx < lx1 * 8; xx++) {
-            const uint8_t* g = &big8[((size_t)(y * 8 + yy) * nw + (x * 8 + xx)) * 3];
+        for (int py = y * 8 + ly0 * 8; py < py_end; py++)
+          for (int px = x * 8 + lx0 * 8; px < px_end; px++) {
+            const float* g = &bigf[((size_t)py * nw + px) * 3];
+            const int yy = py - y * 8, xx = px - x * 8;
             for (int ch = 0; ch < 3; ch++)
-              acc[ch] += g[ch] / 255.f -
+              acc[ch] += g[ch] -
                          (d[((size_t)ch * 512 + yy) * 512 + xx] * 0.5f + 0.5f);
             n++;
           }
@@ -411,110 +518,22 @@ bool Engine::upscale(const uint8_t* rgb, int w, int h, int scale,
       }
       if (dump_tile("dec", r * grid.cols + c, d))
         fprintf(stderr, "[tile] dec %d %d %d %d\n", r * grid.cols + c, r, c, 0);
-      const auto wy = axis_window(kTile, ov, y == 0, y + kTile >= lt_h, win_);
-      const auto wx = axis_window(kTile, ov, x == 0, x + kTile >= lt_w, win_);
-
-      if (!ocm_ && !mb_) {
-        // 基础路径: [-1,1] 域单频带余弦融合
-        for (int yy = 0; yy < 512; yy++)
-          for (int xx = 0; xx < 512; xx++) {
-            const float g = wy[yy / 8] * wx[xx / 8];  // 512px 窗 = latent 窗 x8
-            const size_t oy = (size_t)(y * 8 + yy) * pW + (x * 8 + xx);
-            for (int ch = 0; ch < 3; ch++) img[oy * 3 + ch] += d[((size_t)ch * 512 + yy) * 512 + xx] * g;
-            contrib2[oy] += g;
-          }
-      } else {
-        // ocm / mb 路径: [0,1] 域
-        std::vector<float> d01((size_t)3 * 512 * 512);
-        for (size_t i = 0; i < d01.size(); i++) d01[i] = d[i] * 0.5f + 0.5f;
-
-        // ---- overlap color matching (ocm) ----
-        // 逐 tile 顺序累加时, 画布上已有左/上邻居的结果。在画布权重 >= 0.5
-        // 的重叠条带里统计本 tile 与画布的逐通道 mean/std, 把整 tile 线性拉齐
-        // (gain 限幅 [0.7,1.4]) 后再融合 -> 邻居间亮度/对比度漂移互相锚定。
-        // 注意: 平坦区 (std < ~4/255) 的 std 比值纯是噪声, 必须 gain=1 跳过,
-        // 否则一个歪 gain 会污染画布、被后续 tile 级联放大 (实测能到 150/255)。
-        if (ocm_) {
-          double st[3] = {0, 0, 0}, stq[3] = {0, 0, 0}, sa[3] = {0, 0, 0}, saq[3] = {0, 0, 0};
-          long n = 0;
-          for (int yy = 0; yy < 512; yy++) {
-            const int oy_row = y * 8 + yy;
-            for (int xx = 0; xx < 512; xx++) {
-              const size_t oi = (size_t)oy_row * pW + (x * 8 + xx);
-              if (contrib2[oi] < 0.5f) continue;  // 画布上邻居已主导的像素
-              for (int ch = 0; ch < 3; ch++) {
-                // mb 模式下画布 = 已累加的高带 + 低带; 否则就是完整信号
-                const float a = mb_ ? img[oi * 3 + ch] / contrib2[oi] + imgL[oi * 3 + ch] / cL[oi]
-                                    : img[oi * 3 + ch] / contrib2[oi];
-                const float t = d01[((size_t)ch * 512 + yy) * 512 + xx];
-                sa[ch] += a; saq[ch] += (double)a * a;
-                st[ch] += t; stq[ch] += (double)t * t;
-              }
-              n++;
-            }
-          }
-          if (n >= 2048) {
-            float shift[3] = {0, 0, 0}, gain[3] = {1, 1, 1};
-            for (int ch = 0; ch < 3; ch++) {
-              const float mt = (float)(st[ch] / n), ma = (float)(sa[ch] / n);
-              const float sst = std::sqrt(std::max(0.f, (float)(stq[ch] / n) - mt * mt));
-              const float ssa = std::sqrt(std::max(0.f, (float)(saq[ch] / n) - ma * ma));
-              // std 门限: 两侧都要有像样的纹理才做对比度匹配 (4/255)
-              if (sst > 0.015f && ssa > 0.015f)
-                gain[ch] = std::clamp(ssa / sst, 0.9f, 1.1f);
-              shift[ch] = ma - mt * gain[ch];
-              ocm_shift_sum += std::fabs(shift[ch]);
-              ocm_gain_sum += std::fabs(gain[ch] - 1.f);
-              ocm_n++;
-            }
-            for (int ch = 0; ch < 3; ch++)
-              for (int i = 0; i < 512 * 512; i++) {
-                float& v = d01[(size_t)ch * 512 * 512 + i];
-                v = std::clamp(v * gain[ch] + shift[ch], 0.f, 1.f);
-              }
-          }
+      const auto wy = axis_window(kTile, ov, y == 0, y + kTile >= lt_h);
+      const auto wx = axis_window(kTile, ov, x == 0, x + kTile >= lt_w);
+      // [-1,1] 域单频带余弦融合
+      for (int yy = 0; yy < 512; yy++)
+        for (int xx = 0; xx < 512; xx++) {
+          const float g = wy[yy / 8] * wx[xx / 8];  // 512px 窗 = latent 窗 x8
+          const size_t oy = (size_t)(y * 8 + yy) * pW + (x * 8 + xx);
+          for (int ch = 0; ch < 3; ch++) img[oy * 3 + ch] += d[((size_t)ch * 512 + yy) * 512 + xx] * g;
+          contrib2[oy] += g;
         }
-
-        // ---- multiband blending (mb) ----
-        // 低频 (盒式模糊 r=24px 分离) 用半宽 256px 的宽余弦窗缓变,
-        // 高频保留原 64px 窄窗 -> tone 过渡拉宽, 纹理过渡保持锐利。
-        const float* hi = d01.data();
-        std::vector<float> dlow, dhi;
-        if (mb_) {
-          box_blur_chw(d01, dlow, 3, 512, 512, 24);
-          dhi.resize(d01.size());
-          for (size_t i = 0; i < d01.size(); i++) dhi[i] = d01[i] - dlow[i];
-          hi = dhi.data();
-          const auto wyw = axis_window(512, 256, y == 0, y + kTile >= lt_h, win_);
-          const auto wxw = axis_window(512, 256, x == 0, x + kTile >= lt_w, win_);
-          for (int yy = 0; yy < 512; yy++)
-            for (int xx = 0; xx < 512; xx++) {
-              const float g = wyw[yy] * wxw[xx];
-              const size_t oy = (size_t)(y * 8 + yy) * pW + (x * 8 + xx);
-              for (int ch = 0; ch < 3; ch++)
-                imgL[oy * 3 + ch] += dlow[((size_t)ch * 512 + yy) * 512 + xx] * g;
-              cL[oy] += g;
-            }
-        }
-        // 高频 (或全信号): 窄窗, [0,1] 域累加
-        for (int yy = 0; yy < 512; yy++)
-          for (int xx = 0; xx < 512; xx++) {
-            const float g = wy[yy / 8] * wx[xx / 8];
-            const size_t oy = (size_t)(y * 8 + yy) * pW + (x * 8 + xx);
-            for (int ch = 0; ch < 3; ch++) img[oy * 3 + ch] += hi[((size_t)ch * 512 + yy) * 512 + xx] * g;
-            contrib2[oy] += g;
-          }
-      }
-      if (progress) progress(2, ++done, grid.count());
+      if (progress) progress(2, 2 * grid.count() + ++done, 3 * grid.count());
     }
   if (dcfix_ && grid.count() > 0)
     fprintf(stderr, "[sr] dcfix |offset| mean %.2f/255 max %.2f/255\n",
             off_sum / (grid.count() * 3) * 255.f, off_max * 255.f);
-  if (ocm_ && ocm_n > 0)
-    fprintf(stderr, "[sr] ocm mean |shift| %.2f/255  mean |gain-1| %.3f (%d tiles)\n",
-            ocm_shift_sum / ocm_n * 255.f, ocm_gain_sum / ocm_n, ocm_n / 3);
   std::vector<float>().swap(hr);
-  std::vector<uint8_t>().swap(big8);
 
   // ---- 5. 裁剪 + 归一化到 [0,1] + 尺寸对齐 ----
   std::vector<float> img2((size_t)nh * nw * 3);
@@ -522,24 +541,15 @@ bool Engine::upscale(const uint8_t* rgb, int w, int h, int scale,
     for (int x = 0; x < nw; x++) {
       const size_t si = ((size_t)y * pW + x);
       for (int ch = 0; ch < 3; ch++) {
-        float p;
-        if (mb_)  // 低频宽窗带 + 高频窄窗带 (都在 [0,1] 域)
-          p = std::clamp(img[si * 3 + ch] / contrib2[si] + imgL[si * 3 + ch] / cL[si], 0.f, 1.f);
-        else if (ocm_)  // [0,1] 域单频带
-          p = std::clamp(img[si * 3 + ch] / contrib2[si], 0.f, 1.f);
-        else  // 基础路径: [-1,1] 域
-          p = std::clamp(img[si * 3 + ch] / contrib2[si], -1.f, 1.f) / 2.f + 0.5f;
+        const float p = std::clamp(img[si * 3 + ch] / contrib2[si], -1.f, 1.f) / 2.f + 0.5f;
         img2[((size_t)y * nw + x) * 3 + ch] = p;
       }
     }
   std::vector<float>().swap(img);
   std::vector<float>().swap(contrib2);
-  if (mb_) {
-    std::vector<float>().swap(imgL);
-    std::vector<float>().swap(cL);
-  }
 
   dump_tensor("img2.bin", img2);
+  dump_tensor("bigf.bin", bigf);
 
   // ---- 6. adain 色彩对齐 (作者 adain_color_fix: target=结果, style=bicubic LR) ----
   //     out = (target - mean_t) / std_t * std_s + mean_s   (逐通道标量)
@@ -559,12 +569,12 @@ bool Engine::upscale(const uint8_t* rgb, int w, int h, int scale,
   }
 
   // ---- 6b. 条件偏置修正 (tonefix) ----
-  // 单步蒸馏模型对暗部有系统性提亮 (实测 L20-40 层平均 +1.3/255, L<20 达
-  // +8.8/255), adain 的全局均值/方差匹配和直方图匹配都修不了这种"条件偏置"
-  // (它们只约束边缘分布)。guide 与输出逐像素对齐, 所以可以直接估计条件均值
+  // 单步蒸馏模型对暗部有系统性提亮, adain/直方图匹配只约束边缘分布, 修不了这种
+  // 条件偏置。guide 与输出逐像素对齐, 可直接估计条件均值
   //   bias[g] = E[ sr_luma - guide_luma | guide_luma = g ]
-  // 再从输出里减掉, 等价于按原图曝光校准的一条单调修正曲线, 不动彩色比例。
-  if (tonefix_) {
+  // 从输出里减掉, 等价于按原图曝光校准的单调修正曲线。
+  // 8-bit 直方图是 SDR 统计, HDR (PQ/HLG 码域) 跳过。
+  if (tonefix_ && !hdr) {
     double cnt[256] = {0}, diff[256] = {0};
     const size_t npx2 = (size_t)nw * nh;
     for (size_t i = 0; i < npx2; i++) {
@@ -601,11 +611,10 @@ bool Engine::upscale(const uint8_t* rgb, int w, int h, int scale,
             applied / std::max(napp, 1) * 255.f);
   }
 
-  // ---- 6c. 精确残差回注 (residfix, TINYSR_RESID, 全程 fp32) ----
-  // tile 伪影 (DC 漂移/台阶/色调偏移) 全部生活在低频带 (周期 >= ~24px), 纹理细节
-  // 在高频带: R = 原图 - BOX下采样(输出) 是只含低频伪影的精确残差, 低通后上采样
-  // 加回 => 低频带精确对齐原图, SR 高频不受影响。8bit 中间量化会丢掉亚 1/255 的
-  // 台阶信息 (色彩断层), 因此整条链 fp32, 只在最终写 PNG 时量化一次。
+  // ---- 6c. 精确残差回注 (residfix) ----
+  // tile 伪影 (DC 漂移/台阶) 在低频带 (周期 >= ~24px): R = 原图 - BOX下采样(输出)
+  // 是只含低频伪影的残差, 低通后上采样加回 => 低频带精确对齐原图, SR 高频不动。
+  // 全程 fp32: 8bit 中间量化会丢亚 1/255 的台阶 (色彩断层)。
   if (resid_) {
     const int gw = w, gh = h;
     // a) BOX 下采样到原图尺寸 (均值保持的低通)
@@ -625,15 +634,14 @@ bool Engine::upscale(const uint8_t* rgb, int w, int h, int scale,
     // b) R = 原图(fp32) - D, 打包成 CHW 供模糊
     std::vector<float> Rc((size_t)3 * gh * gw);
     for (int y = 0; y < gh; y++) {
-      const uint8_t* src = rgb + ((size_t)y * gw) * 3;
+      const float* src = rgb01 + ((size_t)y * gw) * 3;
       for (int x = 0; x < gw; x++)
         for (int ch = 0; ch < 3; ch++)
           Rc[((size_t)ch * gh + y) * gw + x] =
-              src[x * 3 + ch] / 255.f - D[((size_t)y * gw + x) * 3 + ch];
+              src[x * 3 + ch] - D[((size_t)y * gw + x) * 3 + ch];
     }
     std::vector<float>().swap(D);
-    // c) σ=resid_r_ 三遍盒式高斯: 只留 tile 级 (周期 >= ~24px) 校正量,
-    //    滤掉原图 JPEG 块噪声 (8px 周期) —— 实测 r<=2 时暗部可见注入噪声
+    // c) σ=resid_r_ 三遍盒式高斯: 只留 tile 级校正量, 滤掉原图 JPEG 块噪声 (8px 周期)
     {
       std::vector<float> tmp;
       for (int p = 0; p < 3; p++) {
@@ -672,21 +680,100 @@ bool Engine::upscale(const uint8_t* rgb, int w, int h, int scale,
     }
   }
 
-  // ---- 7. 尺寸对齐 (nw,nh -> ow,oh, 双三次) + 输出 ----
-  out.resize((size_t)ow * oh * 3);
+  // ---- 6d. 细节预算门控 (flatgate) ----
+  // 虚化/bokeh 是拍摄内容而非退化, 但模型会在近平坦梯度上发明纹理 (光环/布纹)。
+  // 对模型新增细节 D = img2 - bigf 做逐像素预算限幅:
+  //   |D| 允许到 B = kAmp·act + kFloor (act = 源图局部活跃度, box12 平滑)
+  // 超出预算的成分软性压回 (smoothstep 拐点), 预算内结构原样保留。
+  // 相对预算而非绝对阈值: 活跃度幅值跨图不可比, 绝对阈值会全域误杀重压缩软图。
+  if (flatgate_) {
+    // 无证据平坦区的频段抑制 (OBP): D 的 3 层 Laplacian 金字塔,
+    // 低频全保留, 中频保留 (1-0.6M), 高频保留 (1-0.9M)。
+    // bigf 锚点不被模糊 —— 原生虚焦已存在于 bigf, 只处理模型新增内容。
+    if (!fg_mo_.empty()) {
+      const float lam_m = 0.6f, lam_h = 0.9f;
+      std::vector<float> d0((size_t)nh * nw), d1, d2, d3, up, mid, b2u;
+      for (int ch = 0; ch < 3; ch++) {
+        for (size_t i = 0; i < d0.size(); i++) d0[i] = img2[(size_t)i * 3 + ch];
+        down2_ch(d0, d1, nh, nw, up);
+        const int h1 = (nh + 1) / 2, w1 = (nw + 1) / 2;
+        down2_ch(d1, d2, h1, w1, up);
+        const int h2 = (h1 + 1) / 2, w2 = (w1 + 1) / 2;
+        down2_ch(d2, d3, h2, w2, up);
+        const int h3 = (h2 + 1) / 2, w3 = (w2 + 1) / 2;
+        resample_ch(d1, up, h1, w1, nh, nw);              // b0 = d0 - up(d1): 高频
+        for (size_t i = 0; i < d0.size(); i++) d0[i] -= up[i];
+        resample_ch(d2, up, h2, w2, h1, w1);              // b1 = d1 - up(d2): 中频低段
+        for (size_t i = 0; i < d1.size(); i++) d1[i] -= up[i];
+        resample_ch(d3, up, h3, w3, h2, w2);              // b2 = d2 - up(d3): 中频高段
+        for (size_t i = 0; i < d2.size(); i++) d2[i] -= up[i];
+        resample_ch(d3, up, h3, w3, nh, nw);              // up => 低频 (全保留)
+        resample_ch(d1, mid, h1, w1, nh, nw);             // mid => 中频合成
+        resample_ch(d2, b2u, h2, w2, nh, nw);
+        for (size_t i = 0; i < mid.size(); i++) mid[i] += b2u[i];
+        for (size_t i = 0; i < d0.size(); i++) {
+          const float m = fg_mo_[i];
+          img2[(size_t)i * 3 + ch] = up[i] + (1 - lam_m * m) * mid[i] + (1 - lam_h * m) * d0[i];
+        }
+      }
+    }
+    const float kAmp = 4.f, kFloor = 1.5f / 255.f, kKnee = 1.6f;
+    std::vector<float> y((size_t)nw * nh), act, asmooth, dsum((size_t)nw * nh), dsm;
+    for (size_t i = 0; i < y.size(); i++)
+      y[i] = (299.f * bigf[i * 3 + 0] + 587.f * bigf[i * 3 + 1] +
+              114.f * bigf[i * 3 + 2]) / 1000.f;
+    box_blur_chw(y, act, 1, nh, nw, 3);              // 高频能量 (7px 窗)
+    for (size_t i = 0; i < act.size(); i++) act[i] = std::fabs(act[i] - y[i]);
+    box_blur_chw(act, asmooth, 1, nh, nw, 12);       // 源活跃度, 平滑窗保证预算稳定
+    for (int yy = 0; yy < nh; yy++)
+      for (int xx = 0; xx < nw; xx++) {
+        const size_t i = (size_t)yy * nw + xx;
+        float s = 0;
+        for (int ch = 0; ch < 3; ch++) {
+          const float d = img2[i * 3 + ch] - bigf[i * 3 + ch];
+          s += d * d;
+        }
+        dsum[i] = std::sqrt(s / 3.f);
+      }
+    box_blur_chw(dsum, dsm, 1, nh, nw, 12);          // 模型加细节的幅度场
+    double gsum = 0;
+    int nclip = 0;
+    for (int yy = 0; yy < nh; yy++)
+      for (int xx = 0; xx < nw; xx++) {
+        const size_t i = (size_t)yy * nw + xx;
+        const float B = kAmp * asmooth[i] + kFloor;
+        float g = 1.f;
+        if (dsm[i] > B && dsm[i] > 0.f) {
+          const float t = std::clamp((dsm[i] - B) / (kKnee * B - B), 0.f, 1.f);
+          const float ts = t * t * (3.f - 2.f * t);  // smoothstep 拐点: 预算内不动
+          g = (1.f - ts) + ts * (B / dsm[i]);
+          nclip++;
+        }
+        gsum += g;
+        if (g < 1.f)
+          for (int ch = 0; ch < 3; ch++) {
+            const float ref = bigf[i * 3 + ch];
+            img2[i * 3 + ch] = ref + g * (img2[i * 3 + ch] - ref);
+          }
+      }
+    fprintf(stderr, "[sr] flatgate budget mean gain %.3f, clipped px %.1f%%\n",
+            gsum / ((double)nw * nh), 100.0 * nclip / ((double)nw * nh));
+  }
+
+  // ---- 7. 尺寸对齐 (nw,nh -> ow,oh, 双三次) + 本遍输出 (fp32, 量化在 I/O 边界) ----
+  pass_out.assign((size_t)ow * oh * 3, 0.f);
   if (ow == nw && oh == nh) {
-    for (size_t i = 0; i < out.size(); i++)
-      out[i] = (uint8_t)std::clamp((int)std::lround(img2[i] * 255.f), 0, 255);
+    for (size_t i = 0; i < pass_out.size(); i++)
+      pass_out[i] = std::clamp(img2[i], 0.f, 1.f);
   } else {
-    std::vector<float> fin((size_t)ow * oh * 3);
     // 注意: float 版本的 stride 单位是字节 (像素数 * 4)
     const int istride = nw * 3 * (int)sizeof(float), ostride = ow * 3 * (int)sizeof(float);
-    if (!stbir_resize_float_linear(img2.data(), nw, nh, istride, fin.data(), ow, oh, ostride, STBIR_RGB)) {
+    if (!stbir_resize_float_linear(img2.data(), nw, nh, istride, pass_out.data(), ow, oh, ostride, STBIR_RGB)) {
       fprintf(stderr, "[sr] resize failed %dx%d -> %dx%d\n", nw, nh, ow, oh);
       return false;
     }
-    for (size_t i = 0; i < out.size(); i++)
-      out[i] = (uint8_t)std::clamp((int)std::lround(std::clamp(fin[i], 0.f, 1.f) * 255.f), 0, 255);
+    for (size_t i = 0; i < pass_out.size(); i++)
+      pass_out[i] = std::clamp(pass_out[i], 0.f, 1.f);
   }
   return true;
 }

@@ -1,85 +1,106 @@
 # TinySR WebUI
 
-One-click upscaler for **[TinySR](https://github.com/Microtreei/TinySR)** (CVPR 2026 Findings) — a pruned single-step diffusion transformer (DiT) super-resolution model — running entirely on **ncnn** with **fp16**, on **Vulkan GPU** or **CPU**.
+**English** · [简体中文](README.zh-CN.md)
 
-一条命令起一个网页，把任意图片 4× 超分。推理栈只有 ncnn，不依赖 PyTorch / diffusers / OpenVINO。
+One-click upscaler for **[TinySR](https://github.com/Microtreei/TinySR)** (CVPR 2026 Findings) — a pruned single-step diffusion transformer (DiT) super-resolution model — running entirely on **ncnn** with **fp16**, on **Vulkan GPU** or **CPU**. No PyTorch / diffusers / OpenVINO at runtime; a single command serves a web page that upscales any image 4×.
 
-## 特性
+## Features
 
-- **单栈**：C++ + ncnn，无 Python 运行时依赖（导出模型时才需要 PyTorch）。
-- **双后端**：网页里切换 Vulkan GPU（fp16 存储/运算）或 CPU（fp32）。
-- **任意分辨率**：64-latent tile 网格 + 重叠区互补余弦加权融合，不限制输入尺寸。
-- **拼接一致性**：逐 tile DC 对齐 + 曝光校准 + 精确残差回注，平滑/暗部区域无"图块感"。
-- **fp16 而非 INT8**：移动/桌面 GPU 上 fp16 路径成熟且无需反量化，量化收益在这个模型上不成立（见下）。
-- **自包含前端**：单个 `index.html`，拖放 → 上传 → 前后对比滑块 → 下载 PNG。
+- **Single stack**: C++ + ncnn, no Python runtime dependency (PyTorch only needed when exporting models).
+- **Dual backend**: switch between Vulkan GPU (fp16 storage + compute) and CPU (fp32) in the web UI.
+- **Any resolution**: 64-latent tile grid with overlap-region complementary cosine blending; input size is not restricted.
+- **Seamless output**: per-tile DC alignment + exposure calibration + exact residual reinjection — no visible block seams in flat/dark regions.
+- **fp16, not INT8**: fp16 is mature on mobile/desktop GPUs and needs no dequantization path; INT8 quantization does not pay off for this model (see [Why no INT8](#why-no-int8)).
+- **Self-contained frontend**: a single `index.html` — drag & drop, before/after slider with zoom/pan, mix-strength control, format selection, download.
+- **Image formats**: input WebP / TIFF (8/16-bit) / AVIF (SDR + HDR) / DNG; output PNG / JPEG / WebP / AVIF / BMP. HDR (PQ/HLG) passes through at the source bit depth.
 
-## 架构
+## Architecture
 
 ```
-浏览器 (拖放 / 滑块对比)
-   │  multipart POST /api/sr  (image, backend=vulkan|cpu)
+Browser (drag & drop / compare slider)
+   │  multipart POST /api/sr  (image, backend=vulkan|cpu, scale, fmt)
    ▼
 cpp-httplib  (src/main.cpp)
    ▼
-Engine::upscale  (src/engine.cpp)
-   ├─ bicubic 4× → [-1,1] → pad 到 512 倍数
-   ├─ vae_encoder   : 512px 窗口 → 16×64×64 latent   ┐
-   ├─ transformer   : 16×64×64 → 16×64×64 (z−pred)    ├ 共用 64-latent tile 网格
-   ├─ vae_decoder   : 16×64×64 → 512px 窗口           ┘ 重叠区余弦互补融合
-   ├─ 逐 tile DC 对齐 + tonefix（消 tile 间亮度漂移 / 暗部系统性提亮）
-   ├─ 精确残差回注 (residfix)：输出低频带对齐原图，全程 fp32
-   └─ PNG (X-Elapsed-Ms 响应头带服务端耗时)
+Engine::upscale_f  (src/engine.cpp)
+   ├─ bicubic upscale → [-1,1] → pad to multiples of 512
+   ├─ vae_encoder   : 512px window → 16×64×64 latent   ┐
+   ├─ transformer   : 16×64×64 → 16×64×64 (z−pred)      ├ shared latent tile grid,
+   ├─ vae_decoder   : 16×64×64 → 512px window           ┘ cosine blending on overlaps
+   ├─ per-tile DC alignment + tonefix (kills inter-tile luma drift / shadow lift)
+   ├─ exact residual reinjection: output low band aligned to source, all fp32
+   └─ encode to png / jpg / webp / avif / bmp (X-Elapsed-Ms response header)
 ```
 
-模型侧固定约束：`pos_embed` 为固定 1024 token（32×32 patch grid = 512px 像素 tile = 64×64 latent），所以任意分辨率必须 tile。
+Hard constraint on the model side: `pos_embed` is fixed at 1024 tokens (32×32 patch grid = 512px tile = 64×64 latent), so arbitrary resolutions must be tiled.
 
-拼接一致性的问题归因、方案对比与全部实测数据见 **[docs/research.md](docs/research.md)**。
+Root-cause analysis, alternatives and measurements for tiling consistency: **[docs/research.md](docs/research.md)**.
 
-## 预编译包（Releases）
+## Prebuilt packages (Releases)
 
-从 [Releases](../../releases) 下载对应平台 zip（可执行文件 + 前端），另下载 `models.zip` 解压到可执行文件旁的 `models/` 目录：
+Download the zip for your platform from [Releases](../../releases) (binary + frontend), plus `models.zip` unpacked next to the binary:
 
 ```
-tinysr-webui.exe (或 tinysr-webui)
+tinysr-webui.exe (or tinysr-webui)
 web/index.html
-models/*.ncnn.param / *.ncnn.bin   ← 来自 models.zip
+models/*.ncnn.param / *.ncnn.bin   ← from models.zip
 ```
 
-运行期依赖 GPU 驱动提供的 Vulkan loader（Windows: `vulkan-1.dll`，Linux: `libvulkan.so.1`，装了 NVIDIA/AMD/Intel 驱动即有）。纯 CPU 机器请源码 `-DTINYSR_VULKAN=OFF` 自建。
+A Vulkan loader from the GPU driver is required at runtime (Windows: `vulkan-1.dll`, Linux: `libvulkan.so.1` — present once NVIDIA/AMD/Intel drivers are installed). CPU-only machines: build from source with `-DTINYSR_VULKAN=OFF`.
 
-## 构建
+> Windows release builds ship with stb built-in formats only (PNG/JPEG/BMP in/out); the optional system libraries (WebP/TIFF/AVIF/DNG) require a vcpkg-based toolchain on Windows CI and are not wired up yet.
 
-依赖：CMake ≥ 3.14、C++17 编译器、Vulkan loader（`libvulkan.so`，GPU 后端）、系统里有 Vulkan 驱动。
+## Build
+
+Requirements: CMake ≥ 3.14, a C++17 compiler, Vulkan loader (`libvulkan.so`) for the GPU backend.
 
 ```bash
-# 1. 拉依赖 (ncnn 源码 + glslang 子模块 + 4 个单头库)
+# 1. Fetch dependencies (ncnn source + glslang submodule + 4 single-header libs)
 ./tools/setup_third_party.sh
-#    国内/受限网络: HTTPS_PROXY=http://127.0.0.1:PORT ./tools/setup_third_party.sh
+#    Behind a proxy: HTTPS_PROXY=http://127.0.0.1:PORT ./tools/setup_third_party.sh
 
-# 2. 编译 (首次会编译 ncnn + glslang, 12 核约 3-5 分钟)
+# 2. Build (first build compiles ncnn + glslang, ~3-5 min on 12 cores)
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
-只要 CPU 后端可关掉 Vulkan 省编译时间：`cmake -B build -DTINYSR_VULKAN=OFF`（前端会自动检测并禁用 GPU 选项）。
+CPU-only build: `cmake -B build -DTINYSR_VULKAN=OFF` (the frontend auto-detects and disables the GPU option).
 
-依赖版本在 `tools/setup_third_party.sh` 里钉死（ncnn `71f7318` / cpp-httplib `v0.66.0` / stb `9600522` / stb_image_resize2 `a4f303e`），并用 `HTTPS_PROXY` 支持代理；脚本会校验每个头文件的字节数与版本标记，防止拿到错误页或半截文件。
+### Image formats (optional system libraries)
+
+Only royalty-free / open-source formats are supported. **HEIC/HEIF is not supported** (HEVC patent pools are royalty-bearing; use AVIF for the same purpose). Each format is probed at configure time — if the library is missing, that format is silently disabled and the build still succeeds.
+
+| Format | Input | Output | Dependency (auto-detected) |
+| --- | --- | --- | --- |
+| JPEG / PNG / BMP / GIF (first frame) / TGA / PNM / PSD | ✓ | JPEG / PNG / BMP | built-in stb (none) |
+| WebP | ✓ | ✓ (q90) | libwebp |
+| TIFF (grayscale/RGB, 8/16-bit) | ✓ | — | libtiff |
+| AVIF (SDR 8-bit; **HDR 10/12-bit PQ/HLG keeps source bit depth**) | ✓ | ✓ (SDR 8-bit q90, HDR same depth; SVT-AV1/aom encoder, slower on large images) | libavif |
+| DNG (CFA demosaic + camera WB, decoded to sRGB 16-bit) | ✓ | — | LibRaw |
+
+Debian/Ubuntu: `sudo apt install libwebp-dev libtiff-dev libavif-dev libraw-dev` · Fedora: `sudo dnf install libwebp-devel libtiff-devel libavif-devel LibRaw-devel`.
+
+HDR pipeline: PQ/HLG sources are inferred in the perceptual code-domain end to end; AVIF output preserves the source bit depth and NCLX color properties. The frontend disables client-side mixing for HDR/high-bit-depth results (canvas is 8-bit only).
+
+The **mix strength** dropdown (100% default, 10% steps) blends the SR result with an upscaled interpolation anchor entirely in the browser — per pixel `out = m·SR + (1−m)·anchor`. Adjusting it re-blends from the cached result and **never re-runs inference**.
+
+Dependency versions are pinned in `tools/setup_third_party.sh` (ncnn `71f7318` / cpp-httplib `v0.66.0` / stb `9600522` / stb_image_resize2 `a4f303e`), with `HTTPS_PROXY` support and per-file size/version verification.
 
 ### Windows
 
-同一条链路（PowerShell 里用 `cmake -B build` + `cmake --build build --config Release`）：
+Same toolchain (`cmake -B build` + `cmake --build build --config Release` in PowerShell):
 
-- 需要 Vulkan SDK（编译期链接 `vulkan-1.lib`）：[LunarG](https://vulkan.lunarg.com/sdk/home) 安装，或 `choco install vulkan-sdk`
-- MSVC 下 CMake 自动加 `/utf-8`（源码含中文注释）、`NOMINMAX`，并静态链接运行时（用户机器免装 VC Redist）
+- Vulkan SDK required at build time (links `vulkan-1.lib`): [LunarG](https://vulkan.lunarg.com/sdk/home) or `choco install vulkan-sdk`
+- MSVC: CMake adds `/utf-8`, `NOMINMAX`, and static-links the runtime (no VC Redist needed on user machines)
 
-### CI / 发布
+### CI / Release
 
-- **ci.yml**：push/PR 时 Ubuntu + Windows 双矩阵编译 + 冒烟（起服务、`/api/info` 应答）
-- **release.yml**：推 `v*` tag 触发，双平台预编译打包挂到 GitHub Release；模型权重不进 CI，发布后手动 `gh release upload <tag> models.zip`
+- **ci.yml**: Ubuntu + Windows matrix build + smoke test (starts the server, checks `/api/info`) on push/PR.
+- **release.yml**: triggered by `v*` tags; packages both platforms and attaches them to the GitHub Release. Model weights never enter CI — upload `models.zip` manually with `gh release upload <tag> models.zip`.
 
-## 模型
+## Models
 
-`models/` 下的 6 个文件（`*.ncnn.param` / `*.ncnn.bin`）需自行导出，不入库（权重 1.3GB）：
+The 6 files under `models/` (`*.ncnn.param` / `*.ncnn.bin`) must be exported yourself; weights (1.3 GB) are not in the repo:
 
 ```bash
 python tools/export_ncnn.py \
@@ -88,94 +109,89 @@ python tools/export_ncnn.py \
   --out   models
 ```
 
-脚本做三件事：合并 LoRA → `torch.jit.trace(check_trace=False)` → pnnx 转 ncnn。导出后与 torch fp32 对拍：三个模型 max abs diff ≤ 1.5e-5。
+The script merges LoRA → `torch.jit.trace(check_trace=False)` → pnnx → ncnn. Verified against torch fp32: max abs diff ≤ 1.5e-5 across all three models.
 
-导出链路中的坑（已内建在脚本里）：
+Pitfalls already handled in the script:
 
-| 问题 | 处理 |
+| Problem | Handling |
 | --- | --- |
-| `torch.jit.trace` 默认 `check_trace=True` 的 deepcopy 自校验对该图误报 | `check_trace=False`，数值正确性由导出后独立比对兜底 |
-| pnnx 无法转换 6D `reshape/permute`（patchify 还原） | unpatchify 改写为**固定权重 `ConvTranspose2d(k=2,s=2)`**（PixelShuffle 等价），全程只有 4D |
-| `ConvTranspose2d` 权重形状易搞反 | 形状为 `[in, out, kh, kw]`（与 `Conv2d` 相反） |
-| 想要 fp16 但 CPU 又需精度 | `fp16=0` 导出（param/bin 存 fp32），半精度在运行时由 ncnn 的 `use_fp16_*` 打开 |
+| `torch.jit.trace` default `check_trace=True` false-positives on this graph | `check_trace=False`; correctness is verified by an independent post-export comparison |
+| pnnx cannot convert 6D `reshape/permute` (unpatchify) | unpatchify rewritten as a fixed-weight `ConvTranspose2d(k=2,s=2)` (PixelShuffle-equivalent), 4D only |
+| `ConvTranspose2d` weight layout is easy to get wrong | shape is `[in, out, kh, kw]` (opposite of `Conv2d`) |
+| fp16 wanted, but CPU needs precision | export with `fp16=0` (fp32 param/bin); enable half precision at runtime via ncnn `use_fp16_*` |
 
-## 运行
+## Run
 
 ```bash
-./build/tinysr-webui 8014
-# 浏览器打开 http://127.0.0.1:8014
+./build/tinysr-webui 8014 [--verbose]
+# open http://127.0.0.1:8014
 ```
 
-环境变量：
+Environment variables:
 
-| 变量 | 默认 | 说明 |
+| Variable | Default | Description |
 | --- | --- | --- |
-| `TINYSR_MODELS` | `models` | 模型目录 |
-| `TINYSR_THREADS` | 0 | CPU 线程数；0 = `hardware_concurrency()` |
-| `TINYSR_OVERLAP` | 8 | tile 重叠宽度（latent 单位，1 latent = 8 px）；8 实测最优 |
-| `TINYSR_FP16` | 2 | Vulkan 半精度：0 关 / 1 仅 fp16 存储 / 2 存储+运算 |
-| `TINYSR_DCFIX` | 1 | 逐 tile DC 对齐：消 tile 间平均亮度漂移（banding） |
-| `TINYSR_TONEFIX` | 1 | 条件偏置修正：消模型对暗部的系统性提亮 |
-| `TINYSR_RESID` | 1 | **精确残差回注**（compose 后、量化前，全程 fp32，CPU +~2s）：`R = 原图 − BOX↓(输出)` 低通后加回，输出低频带精确对齐原图，SR 高频不动。tile 台阶 0.23/0.32 → **0.03/0.06** /255 |
-| `TINYSR_RESID_R` | 4 | 残差低通盒式模糊半径（原图域 px）；调小会注入原图噪声，4 实测最优 |
-| `TINYSR_RESID_ALPHA` | 1.0 | 残差强度（0=关闭效果） |
-| `TINYSR_OCM` | 0 | Overlap Color Matching（经典 tiling 后处理，实测劣于 dcfix，保留作实验开关） |
-| `TINYSR_MB` | 0 | Multiband Blending（实测与关闭无差异，保留作实验开关） |
-| `TINYSR_PHASE` | 0 | 网格相位偏移（双相位推理实验用，默认关） |
-| `TINYSR_WIN` | 0 | 融合窗形状（0/1 互补余弦坡等价 / 2 Hann；实测无差异） |
-| `TINYSR_DUMP` | 空 | 设成目录时把各阶段中间张量落盘，便于与 Python 对拍 |
-
-OCM / MB / PHASE / WIN 是排查过程中保留的实验开关，对照数据与结论见 [docs/research.md](docs/research.md)。
+| `TINYSR_MODELS` | `models` | model directory |
+| `TINYSR_SCALE` | 4 | default upscale factor (1–8); used when the UI preset and request `scale=` are unset |
+| `TINYSR_VERBOSE` | 0 | 1 = per-tile progress on stderr (same as `--verbose`) |
+| `TINYSR_THREADS` | 0 | CPU threads; 0 = `hardware_concurrency()` |
+| `TINYSR_OVERLAP` | 8 | tile overlap (latent units, 1 latent = 8 px) |
+| `TINYSR_FP16` | 2 | Vulkan half precision: 0 off / 1 fp16 storage / 2 storage + compute |
+| `TINYSR_DCFIX` | 1 | per-tile DC alignment (kills inter-tile luma drift / banding) |
+| `TINYSR_TONEFIX` | 1 | conditional bias correction (kills systematic shadow lift) |
+| `TINYSR_FLATGATE` | 1 | **detail budget gating**: defocus-evidence detection on the LR image; evidenced regions keep model detail, evidence-free flat areas get Laplacian band suppression (λ=0.6/0.9) plus a detail budget clamp of `4×activity + 1.5/255`. 0 = off |
+| `TINYSR_RESID` | 1 | **exact residual reinjection** (post-compose, pre-quantize, all fp32, CPU +~2s): `R = source − BOX↓(output)`, low-passed and added back — the output low band exactly matches the source, SR high frequencies untouched |
+| `TINYSR_RESID_R` | 4 | residual low-pass box radius (source-domain px) |
+| `TINYSR_RESID_ALPHA` | 1.0 | residual strength |
+| `TINYSR_DUMP` | — | set to a directory to dump intermediate tensors of each stage (for diffing against Python) |
 
 ### HTTP API
 
-| 方法 | 路径 | 说明 |
+| Method | Path | Description |
 | --- | --- | --- |
-| GET | `/` | WebUI |
-| GET | `/api/info` | `{"vulkan_capable":true,"scale":4,"tile":512,"step":448,"overlap":8,"threads":12}` |
-| POST | `/api/sr` | multipart: `image=<file>`, `backend=vulkan\|cpu` → `image/png`，响应头 `X-Elapsed-Ms` |
+| GET | `/` | WebUI (zoom/pan compare viewer, wheel zoom, drag pan, freely draggable split line) |
+| GET | `/api/info` | `{"vulkan_capable":true,"gpu":"…","scale":4,"tile":512,"step":448,"overlap":8,"threads":12,"webp":true,"avif":true,"dng":true,…}` |
+| GET | `/api/progress` | current job progress `{job,stage,done,total,elapsed_ms}` (polled by the frontend while uploading) |
+| POST | `/api/sr` | multipart: `image=<file>`, `backend=vulkan\|cpu`, `scale=2\|3\|4…` (default `TINYSR_SCALE`), `fmt=png\|jpg\|bmp\|webp\|avif` (default png) → `image/*` with `X-Elapsed-Ms` / `X-Bit-Depth` / `X-Hdr` headers |
+| POST | `/api/probe` | multipart: `image=<file>` → `{"w","h","bits","hdr","fmt"}` (for formats the browser cannot decode, e.g. DNG) |
 
 ```bash
 curl -s -X POST http://127.0.0.1:8014/api/sr \
      -F image=@in.png -F backend=cpu -D- -o out.png | grep -i x-elapsed
 ```
 
-> **关于预览画质**：4× 之后的大图（如 1950² → 7800²）动辄上亿像素。浏览器把这种图缩到
-> 屏幕尺寸时走的是低质量下采样（mipmap/LOD），在天空、水面这种平滑区会显出 448 px 的
-> 块状明暗差 —— 那是**显示**问题，PNG 本身没有网格缝（实测 tile 边界阶跃 ≤ 0.2/255，
-> 相邻 tile 低频差 std 0.23/255）。所以前端会先在 canvas 里分级高质量缩到长边 2400 px
-> 再显示，下载链接仍是原始分辨率。要看真实画质请下载 PNG 在本地 100% 查看。
+## Performance
 
-## 性能参考
+Machine: Intel Core Ultra (Arc B370 iGPU) + 12-thread CPU, Linux.
 
-机器：Intel Core Ultra（Arc B370 iGPU）+ 12 线程 CPU，Linux。
-
-| 输入 → 输出 | 后端 | tile 数 | 服务端耗时 |
+| Input → Output | Backend | Tiles | Server time |
 | --- | --- | --- | --- |
-| 512×288 → 2048×1152 | Vulkan (fp16 存储+运算) | 20 | **7.0 s** |
-| 512×288 → 2048×1152 | CPU (12 线程) | 20 | 41.2 s |
+| 512×288 → 2048×1152 | Vulkan (fp16 storage+compute) | 20 | **7.0 s** |
+| 512×288 → 2048×1152 | CPU (12 threads) | 20 | 41.2 s |
 | 1672×941 → 6688×3764 (25MP) | Vulkan (fp16) | 160 | **54.3 s** |
-| 1672×941 → 6688×3764 (25MP) | CPU (12 线程) | 160 | 298.9 s |
+| 1672×941 → 6688×3764 (25MP) | CPU (12 threads) | 160 | 298.9 s |
 
-tile 吞吐：Vulkan 约 0.34 s/tile，CPU 约 1.9 s/tile（约 5.5×）。
+Throughput: ~0.34 s/tile on Vulkan, ~1.9 s/tile on CPU (~5.5×).
 
-精度（Vulkan fp16 vs CPU fp32，0–255 尺度，目视无差异）：512×288 mean 0.32 / max 28；1672×941 mean 0.20 / max 55。仅 fp16 存储时误差更小（裁剪图 mean 0.11 / max 9）。默认 fp16 存储+运算，`TINYSR_FP16=1` 切保守模式，`TINYSR_FP16=0` 完全关闭半精度。
+The 2× mode (`scale=2`, selectable in the UI) covers 1/4 the tiles of 4× for the same input: ~3–4.4× faster; round-trip fidelity PSNR 33.4 vs 36.2 (night) / 39.6 vs 42.5 (bright) — an explicit speed-for-fidelity trade-off (smaller bicubic pre-upscale means each 512px tile covers twice the source area).
 
-后端首次请求时才加载对应模型（约 1.4 GB 权重），切换后端会重新加载，之后常驻。
+Precision (Vulkan fp16 vs CPU fp32, 0–255 scale, visually identical): 512×288 mean 0.32 / max 28; 1672×941 mean 0.20 / max 55. Storage-only fp16 is tighter (mean 0.11 / max 9). Default is storage+compute; `TINYSR_FP16=1` for the conservative mode, `TINYSR_FP16=0` to disable.
 
-## 为什么不做 INT8
+Backends load their model (≈1.4 GB weights) on first request and stay resident; switching backends reloads.
 
-在本模型上做过完整的量化对照实验（多个后端实现结论一致）：
+## Why no INT8
 
-- **全 PTQ INT8**（MINMAX / 去 outlier / SmoothQuant 三种策略）：延迟反而慢 27%，输出与 fp32 的最大差达 2.4–2.6（0–255 尺度）——直接崩图。
-- **weight-only INT8**：等速、省内存，精度可用，但收益不足以支撑在移动 GPU 上引入反量化路径。
+Full quantization experiments were run on this model (consistent across backends):
 
-所以发布版锁定 **fp16**：桌面/移动 GPU 都有原生 fp16 存储与 FMA，精度损失可忽略，且不需要反量化。
+- **Full PTQ INT8** (MINMAX / outlier removal / SmoothQuant): 27% *slower*, and output deviates from fp32 by up to 2.4–2.6 (0–255) — broken results.
+- **Weight-only INT8**: same speed, saves memory, accuracy acceptable — but not worth adding a dequantization path on mobile GPUs.
 
-## 许可
+Releases therefore ship **fp16** only: native fp16 storage and FMA on desktop/mobile GPUs, negligible accuracy loss, no dequantization.
 
-- 代码（本仓库）：MIT。
-- TinySR 模型/代码：遵循原仓库许可。
-- SD3 底模（Locomotive / pruned backbone）：**Stability AI Community License**，商用需另行确认。
+## License
 
-导出模型与权重不随本仓库分发（Releases 的 models.zip 或自导出）。
+- Code (this repo): MIT.
+- TinySR model/code: follow the upstream repository license.
+- SD3 base model (Locomotive / pruned backbone): **Stability AI Community License** — check terms before commercial use.
+
+Exported models and weights are not distributed with this repo (grab `models.zip` from Releases or export your own).

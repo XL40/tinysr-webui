@@ -28,9 +28,9 @@ jobs:
         shell: bash
         run: bash tools/setup_third_party.sh
 
-      - name: install Vulkan headers/loader (Linux)
+      - name: install Vulkan headers/loader + image format libs (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libvulkan-dev
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libvulkan-dev libwebp-dev libtiff-dev libavif-dev libraw-dev
 
       # 编译期只需 Vulkan SDK (vulkan-1.lib + 头文件); glslc 不需要 (ncnn 自带 glslang)
       # 版本必须还在 LunarG 服务器上 (老版本会被下架, 换版本前先 curl -I 探测)
