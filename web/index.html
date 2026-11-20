@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TinySR WebUI — 单步扩散超分</title>
+<style>
+  :root { --bg:#0f1216; --panel:#171c23; --line:#2a323d; --fg:#d7dee8; --dim:#8b97a7; --acc:#4da3ff; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; }
+  .wrap { max-width:1200px; margin:0 auto; padding:24px 20px 60px; }
+  h1 { font-size:20px; margin:0 0 4px; font-weight:650; }
+  h1 span { color:var(--acc); }
+  .sub { color:var(--dim); font-size:13px; margin-bottom:20px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:16px; }
+  .drop { border:1.5px dashed var(--line); border-radius:10px; padding:36px 20px; text-align:center; color:var(--dim); cursor:pointer; transition:.15s; }
+  .drop:hover, .drop.over { border-color:var(--acc); color:var(--fg); background:#10161e; }
+  .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+  .row + .row { margin-top:12px; }
+  label { color:var(--dim); font-size:13px; }
+  select, button { background:#10161e; color:var(--fg); border:1px solid var(--line); border-radius:8px; padding:8px 12px; font-size:14px; }
+  select:focus { outline:1px solid var(--acc); }
+  button.primary { background:var(--acc); border-color:var(--acc); color:#04121f; font-weight:650; cursor:pointer; }
+  button.primary:disabled { opacity:.45; cursor:default; }
+  .meta { color:var(--dim); font-size:13px; }
+  .meta b { color:var(--fg); }
+  .views { display:grid; grid-template-columns:1fr; gap:16px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; overflow:hidden; }
+  .card header { padding:10px 14px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; color:var(--dim); font-size:12.5px; }
+  .card img { display:block; width:100%; height:auto; background:#0a0d10; }
+  .slider { position:relative; user-select:none; }
+  .slider img { position:absolute; inset:0; width:100%; height:100%; object-fit:contain; }
+  .slider .after { position:absolute; inset:0; clip-path:inset(0 50% 0 0); }
+  .slider input { position:absolute; bottom:12px; left:4%; width:92%; accent-color:var(--acc); }
+  .slider .frame { position:relative; padding-top:66%; }
+  .spinner { display:inline-block; width:14px; height:14px; border:2px solid var(--line); border-top-color:var(--acc); border-radius:50%; animation:spin .8s linear infinite; vertical-align:-2px; margin-right:6px; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  .hint { color:var(--dim); font-size:12px; margin-top:10px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>TinySR <span>WebUI</span></h1>
+  <div class="sub">剪枝 DiT 单步扩散超分 · ncnn 双后端（Vulkan GPU fp16 / CPU）· 任意分辨率 tile 推理</div>
+
+  <div class="panel">
+    <div class="drop" id="drop">
+      <div>点击选择 或 拖放图片到这里</div>
+      <div class="hint" id="pickInfo"></div>
+      <input type="file" id="file" accept="image/*" hidden>
+    </div>
+    <div class="row" style="margin-top:14px">
+      <label>后端</label>
+      <select id="backend">
+        <option value="vulkan">Vulkan GPU（fp16）</option>
+        <option value="cpu">CPU</option>
+      </select>
+      <label>放大</label>
+      <select id="scale"><option value="4" selected>4×</option></select>
+      <button class="primary" id="run" disabled>开始超分</button>
+      <span class="meta" id="status"></span>
+    </div>
+    <div class="hint">输出尺寸 = 输入 × 4。tile 管线，任意分辨率可用。</div>
+  </div>
+
+  <div class="views" id="views" hidden>
+    <div class="card">
+      <header><span>对比（拖动滑块）</span><span id="dims"></span></header>
+      <div class="slider" id="slider">
+        <div class="frame">
+          <img id="imgBefore" alt="before">
+          <img id="imgAfter" class="after" alt="after">
+        </div>
+        <input type="range" id="range" min="0" max="100" value="50">
+      </div>
+    </div>
+    <div class="card">
+      <header><span>结果（4×）<span id="previewNote" style="opacity:.7"></span></span><a id="dl" href="#" download="tinysr_4x.png" style="color:var(--acc);text-decoration:none">下载 PNG</a></header>
+      <img id="imgFull" alt="result">
+    </div>
+  </div>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+let file = null, beforeURL = null, previewURL = null, imgW = 0, imgH = 0;
+
+// 与服务端 tile 策略一致 (参数从 /api/info 取: 512px tile, step = (64-overlap)*8)
+let TILE_PX = 512, STEP_PX = 448;
+function estTiles(w, h) {
+  const nw = Math.floor(w * 4 / 8) * 8, nh = Math.floor(h * 4 / 8) * 8;
+  const pW = Math.ceil(nw / TILE_PX) * TILE_PX, pH = Math.ceil(nh / TILE_PX) * TILE_PX;
+  return Math.ceil((pW / 8) / (STEP_PX / 8)) * Math.ceil((pH / 8) / (STEP_PX / 8));
+}
+
+// 探测后端能力: 没有 Vulkan 设备时禁用 GPU 选项
+fetch('/api/info').then(r => r.json()).then(info => {
+  if (info.tile) TILE_PX = info.tile;
+  if (info.step) STEP_PX = info.step;
+  const sel = $('backend'), opt = sel.querySelector('option[value=vulkan]');
+  if (!info.vulkan_capable) {
+    opt.disabled = true;
+    opt.textContent = 'Vulkan GPU（本机不可用）';
+    sel.value = 'cpu';
+  }
+}).catch(() => {});
+
+function setStatus(html) { $('status').innerHTML = html; }
+
+$('drop').addEventListener('click', () => $('file').click());
+$('drop').addEventListener('dragover', e => { e.preventDefault(); $('drop').classList.add('over'); });
+$('drop').addEventListener('dragleave', () => $('drop').classList.remove('over'));
+$('drop').addEventListener('drop', e => {
+  e.preventDefault(); $('drop').classList.remove('over');
+  if (e.dataTransfer.files.length) pick(e.dataTransfer.files[0]);
+});
+$('file').addEventListener('change', e => { if (e.target.files.length) pick(e.target.files[0]); });
+
+function pick(f) {
+  if (!f.type.startsWith('image/')) return setStatus('请选择图片文件');
+  file = f;
+  if (beforeURL) URL.revokeObjectURL(beforeURL);
+  beforeURL = URL.createObjectURL(f);
+  const img = new Image();
+  img.onload = () => {
+    imgW = img.width; imgH = img.height;
+    const t = estTiles(imgW, imgH);
+    $('pickInfo').textContent = `${f.name} · ${imgW}×${imgH} → ${imgW*4}×${imgH*4} · ${t} tiles`;
+    $('imgBefore').src = beforeURL;
+    $('run').disabled = false;
+  };
+  img.src = beforeURL;
+}
+
+// 预览图上限 (长边像素). 与 CSS 宽度 1200 * 2(dpr) 对齐, 浏览器只需 1:1 贴图.
+// 浏览器把上亿字节/几千万像素的大图缩到屏幕尺寸时会走低质量下采样 (mipmap/LOD),
+// 在平滑区 (天空/水面) 会显出 448px 的块状明暗差 —— 文件本身没有问题, 只是显示路径太粗糙。
+// 这里先用 canvas 分级减半做高质量缩小, 拿到一张天然尺寸合适的小图, 浏览器就不用再缩放。
+const PREVIEW_MAX = 2400;
+
+function loadImage(url) {
+  return new Promise((res, rej) => {
+    const i = new Image();
+    i.onload = () => res(i);
+    i.onerror = () => rej(new Error('图片解码失败'));
+    i.src = url;
+  });
+}
+
+async function makePreviewURL(img, fallbackURL) {
+  const w = img.naturalWidth, h = img.naturalHeight;
+  const k = Math.min(1, PREVIEW_MAX / Math.max(w, h));
+  if (k >= 0.999) return fallbackURL;
+  try {
+    const tw = Math.round(w * k), th = Math.round(h * k);
+    const draw = (src, nw, nh) => {
+      const c = document.createElement('canvas');
+      c.width = nw; c.height = nh;
+      const ctx = c.getContext('2d');
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(src, 0, 0, nw, nh);
+      return c;
+    };
+    let cur = draw(img, Math.min(w, tw * 2), Math.min(h, th * 2));   // 第一刀 ≤2x
+    while (cur.width / 2 > tw) cur = draw(cur, Math.round(cur.width / 2), Math.round(cur.height / 2));
+    const out = (cur.width !== tw || cur.height !== th) ? draw(cur, tw, th) : cur;
+    const blob = await new Promise(res => out.toBlob(res, 'image/png'));
+    return blob ? URL.createObjectURL(blob) : fallbackURL;
+  } catch (e) {
+    return fallbackURL;   // canvas 失败就退回原图 (最坏情况只是显示粗糙)
+  }
+}
+
+$('run').addEventListener('click', async () => {
+  if (!file) return;
+  $('run').disabled = true;
+  const t0 = performance.now();
+  const tiles = estTiles(imgW, imgH);
+  const per = $('backend').value === 'vulkan' ? 0.36 : 1.9;  // 实测每 tile 秒数
+  setStatus(`<span class="spinner"></span>推理中…（${tiles} tiles，预计 ~${Math.max(1, Math.round(tiles * per + 3))}s）`);
+  const fd = new FormData();
+  fd.append('image', file);
+  fd.append('backend', $('backend').value);
+  try {
+    const r = await fetch('/api/sr', { method: 'POST', body: fd });
+    if (!r.ok) throw new Error(await r.text());
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);            // 原图: 只给下载, 预览不用它
+    const pic = await loadImage(url);
+    const dims = `${pic.naturalWidth}×${pic.naturalHeight}`;
+    const view = await makePreviewURL(pic, url);      // 预览: 预先高质量缩小
+    if (previewURL) URL.revokeObjectURL(previewURL);
+    previewURL = (view !== url) ? view : null;
+    $('imgAfter').src = view;
+    $('imgFull').src = view;
+    $('dl').href = url;
+    $('dims').textContent = dims;
+    // 对比框按结果比例撑开 (默认 66% 只是占位)
+    $('slider').querySelector('.frame').style.paddingTop = (imgH * 4 / (imgW * 4) * 100).toFixed(2) + '%';
+    $('dl').download = (file.name.replace(/\.[^.]+$/, '') || 'tinysr') + '_4x.png';
+    $('previewNote').textContent = (view !== url) ? ` · 预览缩放至 ${PREVIEW_MAX}px（下载为原分辨率）` : '';
+    $('views').hidden = false;
+    const srv = r.headers.get('X-Elapsed-Ms');
+    const total = ((performance.now() - t0) / 1000).toFixed(2);
+    setStatus(`完成 · 服务端 ${srv ? (+srv / 1000).toFixed(2) + 's' : '?'} · 端到端 ${total}s`);
+    $('views').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  } catch (err) {
+    setStatus('失败: ' + err.message);
+  } finally {
+    $('run').disabled = false;
+  }
+});
+
+$('range').addEventListener('input', e => {
+  $('imgAfter').style.clipPath = `inset(0 ${100 - e.target.value}% 0 0)`;
+});
+</script>
+</body>
+</html>

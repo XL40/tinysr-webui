@@ -1,0 +1,48 @@
+# 构建产物
+build/
+*.o
+*.a
+*.so
+
+# 模型权重 (体积大, 请自行导出或从 Release 下载)
+models/*.bin
+models/*.param
+models/*.pt
+
+# 导出中间产物 (torchscript / pnnx)
+models/*.pt
+models/*.pnnx.param
+models/*.pnnx.bin
+models/*.pnnx.onnx
+models/*_pnnx.py
+models/*_ncnn.py
+*.pt
+*.pnnx.param
+*.pnnx.bin
+*.pnnx.onnx
+*_pnnx.py
+
+# 第三方源码 / 单头库 (按 README 步骤拉取)
+third_party/ncnn/
+third_party/include/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+__pycache__/
+*.pyc
+
+# 本地调试产物
+.debug/
+
+# 实验产物
+diagnostics/
+*.zip
+.venv/
+
+# 本地实验工具 (非编译必需, 不入库)
+tools/photocalib.py
+tools/residfix.py
+tools/twophase.py
+tools/diagnose.py

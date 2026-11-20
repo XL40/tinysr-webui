@@ -1,0 +1,94 @@
+# 双平台编译冒烟: push/PR 时验证 Linux + Windows 都能构建、服务能起
+name: ci
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'web/**'
+      - '.gitignore'
+      - 'LICENSE'
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # ncnn/glslang 源码 + stb/httplib 单头库, commit 全部钉死
+      - name: fetch third-party (pinned)
+        shell: bash
+        run: bash tools/setup_third_party.sh
+
+      - name: install Vulkan headers/loader (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libvulkan-dev
+
+      # 编译期只需 Vulkan SDK (vulkan-1.lib + 头文件); glslc 不需要 (ncnn 自带 glslang)
+      # 版本必须还在 LunarG 服务器上 (老版本会被下架, 换版本前先 curl -I 探测)
+      - name: install Vulkan SDK (Windows)
+        if: runner.os == 'Windows'
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: 1.3.296.0
+          cache: true
+
+      - name: configure
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            # Ninja: 并行度默认 = 核数, 避免 make 无上限 -j 撑爆 runner
+            cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          else
+            cmake -B build -DCMAKE_BUILD_TYPE=Release
+          fi
+
+      - name: build
+        shell: bash
+        run: cmake --build build --config Release --parallel
+
+      # Windows Defender 会查杀新编译的未签名 exe (动态加载 DLL + 监听端口的组合
+      # 是经典误报), 导致冒烟时进程凭空消失。把构建目录加白名单。
+      - name: exclude build dir from Defender (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE"
+
+      - name: smoke (server boots, /api/info responds)
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then BIN=build/Release/tinysr-webui.exe; else BIN=build/tinysr-webui; fi
+          "$BIN" 18099 > server.log 2>&1 &
+          PID=$!
+          OK=0
+          for i in $(seq 1 30); do
+            if curl -sf -m 5 http://127.0.0.1:18099/api/info | grep -q '"scale": 4'; then OK=1; break; fi
+            sleep 1
+          done
+          if [ "$OK" != "1" ]; then
+            echo "::error::smoke test failed"
+            echo "===== server.log ====="
+            cat server.log || true
+            echo "===== curl verbose ====="
+            curl -v -m 5 http://127.0.0.1:18099/api/info || true
+            echo "===== process / sockets ====="
+            if [ "$RUNNER_OS" = "Windows" ]; then
+              netstat -ano | grep 18099 || true
+              tasklist //FI "IMAGENAME eq tinysr-webui.exe" || true
+              ls -la "$BIN" || echo "exe file GONE (antivirus quarantine?)"
+              powershell -NoProfile -Command "Get-MpThreatDetection -ErrorAction SilentlyContinue | Select-Object -First 5 | Format-List InitialDetectionTime,ProcessName,Resources" || true
+            else
+              ss -ltnp 2>/dev/null | grep 18099 || true
+            fi
+          fi
+          kill $PID 2>/dev/null || true
+          [ "$OK" = "1" ] || exit 1
+          echo "smoke OK ($RUNNER_OS)"

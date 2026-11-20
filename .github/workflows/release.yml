@@ -1,0 +1,126 @@
+# 发布: 推 v* tag -> 双平台预编译 -> GitHub Release 挂平台 zip
+# 模型权重 (1.3GB) 不在 CI 里: 用 gh release upload models.zip 手动补挂,
+# 或放到 HuggingFace (见 README「模型获取」)
+name: release
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            pkg: linux-x86_64
+          - os: windows-latest
+            pkg: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: fetch third-party (pinned)
+        shell: bash
+        run: bash tools/setup_third_party.sh
+
+      - name: install Vulkan headers/loader (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libvulkan-dev
+
+      - name: install Vulkan SDK (Windows)
+        if: runner.os == 'Windows'
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: 1.3.296.0
+          cache: true
+
+      - name: configure & build
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          else
+            cmake -B build -DCMAKE_BUILD_TYPE=Release
+          fi
+          cmake --build build --config Release --parallel
+
+      - name: exclude build dir from Defender (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE"
+
+      - name: smoke
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then BIN=build/Release/tinysr-webui.exe; else BIN=build/tinysr-webui; fi
+          "$BIN" 18099 > server.log 2>&1 &
+          PID=$!
+          OK=0
+          for i in $(seq 1 30); do
+            if curl -sf -m 5 http://127.0.0.1:18099/api/info | grep -q '"scale": 4'; then OK=1; break; fi
+            sleep 1
+          done
+          if [ "$OK" != "1" ]; then
+            echo "::error::smoke test failed"
+            echo "===== server.log ====="
+            cat server.log || true
+            echo "===== curl verbose ====="
+            curl -v -m 5 http://127.0.0.1:18099/api/info || true
+            echo "===== process / sockets ====="
+            if [ "$RUNNER_OS" = "Windows" ]; then
+              netstat -ano | grep 18099 || true
+              tasklist //FI "IMAGENAME eq tinysr-webui.exe" || true
+            else
+              ss -ltnp 2>/dev/null | grep 18099 || true
+            fi
+          fi
+          kill $PID 2>/dev/null || true
+          [ "$OK" = "1" ] || exit 1
+
+      - name: package
+        shell: bash
+        run: |
+          NAME=tinysr-webui-${{ matrix.pkg }}
+          if [ "$RUNNER_OS" = "Windows" ]; then BIN=build/Release/tinysr-webui.exe; else BIN=build/tinysr-webui; fi
+          mkdir -p "dist/$NAME/web" "dist/$NAME/models"
+          cp "$BIN" "dist/$NAME/"
+          cp web/index.html "dist/$NAME/web/"
+          cp LICENSE README.md "dist/$NAME/"
+          cp models/README.md "dist/$NAME/models/"
+          cd dist
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a -tzip "$NAME.zip" "$NAME" >/dev/null
+          else
+            zip -qr "$NAME.zip" "$NAME"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tinysr-webui-${{ matrix.pkg }}
+          path: dist/tinysr-webui-${{ matrix.pkg }}.zip
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+
+      - name: attach zips to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          body: |
+            平台包内含可执行文件 + 前端; **模型权重需另行下载**:
+            - `models.zip` (1.3GB, 不随每个版本重发): 若本版本资产里没有, 请到
+              最早包含它的 Release (通常为首个 v0.x) 下载 —— 权重只在导出链路变化时才更新
+            - 或从原始 TinySR checkpoint 自行导出 (README「模型」一节)
+            Windows 需 GPU 驱动自带 vulkan-1.dll (装了 NVIDIA/AMD/Intel 驱动即有);
+            Linux 需 libvulkan.so.1 (同样来自驱动)。纯 CPU 机器请源码 `-DTINYSR_VULKAN=OFF` 自建。
